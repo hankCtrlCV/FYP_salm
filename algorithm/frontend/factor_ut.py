@@ -297,7 +297,6 @@ class BearingRangeUTFactor(Factor):
         dy = lm_y - pose_y
         
         rng = np.hypot(dx, dy)
-        # ✔️补丁2a: 对bearing立即wrap
         bearing = wrap_angle(np.arctan2(dy, dx))
         return np.array([rng, bearing])
 
@@ -319,46 +318,70 @@ class BearingRangeUTFactor(Factor):
         return "gbp"
 
     def _gbp_linearize(self,
-                       mu_p: np.ndarray,
-                       mu_l: np.ndarray,
-                       residual: np.ndarray,
-                       distance: float) -> Dict:
-        """GBP线性化实现"""
+                    mu_p: np.ndarray,
+                    mu_l: np.ndarray,
+                    residual: np.ndarray,
+                    distance: float) -> dict:
+        """GBP线性化实现（完整修复交叉项维度问题）"""
         dx = mu_l[0] - mu_p[0]
         dy = mu_l[1] - mu_p[1]
         r = max(distance, _SMALL_NUMBER)  # 防止距离为0
         q = r**2
         
-        # Jacobian矩阵
+        # Jacobian矩阵 (确保维度对齐)
         J_p = np.array([
             [-dx/r, -dy/r, 0],
-            [dy/q, -dx/q, -1]
-        ])
+            [dy/q, -dx/q, -1]   # 注意最后一列是位姿的旋转分量导数
+        ])  # shape (2,3)
         
         J_l = np.array([
             [dx/r, dy/r],
-            [-dy/q, dx/q]
-        ])
+            [-dy/q, dx/q]       # 仅2列对应路标xy
+        ])  # shape (2,2)
         
-        # 信息矩阵计算
-        Λ_p = J_p.T @ self.Rinv @ J_p
-        Λ_l = J_l.T @ self.Rinv @ J_l
-        Λ_cross = J_p.T @ self.Rinv @ J_l
+        # 信息矩阵计算 (核心修复)
+        Λ_p = J_p.T @ self.Rinv @ J_p   # (3,3)
+        Λ_l = J_l.T @ self.Rinv @ J_l   # (2,2)
+        Λ_cross = J_p.T @ self.Rinv @ J_l   # (3,2) 位姿→路标交叉项
         
-        # 信息向量计算 - 符号修正
-        η_p = J_p.T @ self.Rinv @ residual - (Λ_p @ mu_p + Λ_cross @ mu_l)
-        η_l = J_l.T @ self.Rinv @ residual - (Λ_l @ mu_l + Λ_cross.T @ mu_p)
+        # 信息向量计算 (使用通用公式避免符号错误)
+        residual = residual.reshape(2, 1)  # 确保列向量
+        η_p = J_p.T @ self.Rinv @ residual - (Λ_p @ mu_p.reshape(3,1) + Λ_cross @ mu_l.reshape(2,1))
+        η_l = J_l.T @ self.Rinv @ residual - (Λ_l @ mu_l.reshape(2,1) + Λ_cross.T @ mu_p.reshape(3,1))
         
         # 更新状态
         self._current_mode = "gbp"
         self._Λy = self.Rinv
         
+        # 保存原始交叉项供后续检索 (关键!)
+        self._last_Λ_cross = Λ_cross  # shape (3,2)
+        self._last_dim_pose = mu_p.size  # 3
+        self._last_dim_lm = mu_l.size    # 2
+        
         return {
-            self.pose_key: (Λ_p, η_p),
-            self.lm_key: (Λ_l, η_l),
-            (self.pose_key, self.lm_key): Λ_cross,
-            (self.lm_key, self.pose_key): Λ_cross.T  # 对称交叉块
+            # 对角块
+            self.pose_key: (Λ_p, η_p.flatten()),
+            self.lm_key: (Λ_l, η_l.flatten()),
+            # 只返回一个方向的交叉项 (避免装配冲突)
+            (self.pose_key, self.lm_key): Λ_cross
         }
+    
+    # def cross_block(self, var_i: str, var_j: str) -> np.ndarray:
+    #     """按需返回交叉项（自动处理维度方向）"""
+    #     # 请求顺序与计算顺序一致
+    #     if (var_i == self.pose_key) and (var_j == self.lm_key):
+    #         return self._last_Λ_cross  # (3,2)
+        
+    #     # 请求顺序相反（主动转置）
+    #     if (var_i == self.lm_key) and (var_j == self.pose_key):
+    #         return self._last_Λ_cross.T  # (2,3)
+        
+    #     # 未知请求返回零矩阵 (安全降级)
+    #     dim_i = self._last_dim_pose if var_i == self.pose_key else self._last_dim_lm
+    #     dim_j = self._last_dim_pose if var_j == self.pose_key else self._last_dim_lm
+    #     return np.zeros((dim_i, dim_j))
+    def cross_block(self, var_i, var_j):
+        return self._compute_cross(var_i, var_j)
 
     def _spbp_linearize(self,
                         mu_x: np.ndarray,

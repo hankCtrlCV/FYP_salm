@@ -112,9 +112,9 @@ def main():
     
     # Create landmarks (5 randomly distributed landmarks)
     landmarks_data = landmarks(
-        num=10, 
+        num=5, 
         distribution="gaussian", 
-        sigma=[3, 3]  # Standard deviation 7 meters
+        sigma=[7, 7]  # Standard deviation 7 meters
     )
     
     # Create trajectory (1 robot, 50 poses, figure-8 motion)
@@ -377,10 +377,10 @@ def main():
              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
              verticalalignment='top', fontsize=10, fontfamily='DejaVu Sans')
     
-    # Save and show results
+    # # Save and show results
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.savefig("slam_results.png", dpi=150, bbox_inches='tight')
-    logger.info("Results saved to slam_results.png")
+    # plt.savefig("slam_results.png", dpi=150, bbox_inches='tight')
+    # logger.info("Results saved to slam_results.png")
     
     # ========= 8. Final Performance Report =========
     logger.info("=" * 60)
