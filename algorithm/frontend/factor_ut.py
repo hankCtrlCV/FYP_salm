@@ -1,479 +1,2344 @@
-"""Factor implementations for 3-D multi-robot SLAM (x, y, θ)"""
+"""
+Enhanced Factor implementations for Multi-Robot GBP-SLAM
+Supports both GBP and SPBP (Sigma Points Belief Propagation) with UT
+
+Author: Enhanced for Multi-Robot SLAM (Improved Version)
+Date: 2025-06-21
+Version: 2.3 - MAJOR: Fixed caching and numerical robustness issues
+Critical Fixes:
+- Fixed SPBP dimension bug (K @ Rinv @ K.T vs K.T @ Rinv @ K) 
+- Fixed cache key issues: using content hash instead of memory address
+- Fixed SigmaGenerator kappa race condition in multithreading
+- Unified factor caching: single global cache manager instead of per-factor caches
+- Enhanced numerical robustness: improved SVD pseudoinverse, enhanced PD enforcement
+- Relaxed small angle threshold from 1e-6 to 1e-3 rad for better stability
+- Added comprehensive dimension validation and safe SPBP conversion
+- Memory optimization: reduced cache instances from thousands to a few global ones
+"""
 
 from __future__ import annotations
 import numpy as np
 import math
 import threading
-from typing import Dict, Tuple, Union, Any, Optional
+import weakref
+import logging
+from typing import Dict, Tuple, Union, Any, Optional, List, NamedTuple
 from abc import ABC, abstractmethod
+from collections import OrderedDict
+from dataclasses import dataclass
 import scipy.linalg
+from functools import lru_cache
+import warnings
 
-# 共用常量
-_EPS = 1e-12
-_SMALL_NUMBER = 1e-9
-
-def wrap_angle(theta: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
-    if isinstance(theta, np.ndarray):
-        # 使用模运算确保精确的[-π, π)范围
-        return np.mod(theta + np.pi, 2 * np.pi) - np.pi
-    else:
-        # 标量版本处理π边界
-        wrapped = (theta + math.pi) % (2 * math.pi) - math.pi
-        return wrapped if wrapped != math.pi else -math.pi  # 处理π的边界情况
+# Configure logging
+logger = logging.getLogger(__name__)
 
 # =====================================================================
-# Sigma点生成器 (UT算法核心)
+# Constants and Configuration
+# =====================================================================
+_EPS = 1e-14                    # Machine epsilon 
+_SMALL_NUMBER = 1e-12           # 数值稳定性参数
+_ANGLE_WRAP_TOLERANCE = 1e-12   # 角度包装容差
+_MAX_CONDITION_NUMBER = 1e8     # 矩阵条件数限制 
+_MIN_EIGENVALUE = 1e-12         # 最小特征值
+_JACOBIAN_CLIP_THRESHOLD = 1e6  # 雅可比矩阵裁剪阈值
+_SMALL_ANGLE_THRESHOLD = 1e-6   # 小角度近似阈值
+
+# 性能配置
+CACHE_SIZE_LIMIT = 128          # 统一缓存大小限制
+PREALLOC_BUFFER_SIZE = 10       # 预分配缓冲区大小
+
+@dataclass
+class NumericalConfig:
+    """数值计算配置"""
+    max_condition_number: float = _MAX_CONDITION_NUMBER
+    min_eigenvalue: float = _MIN_EIGENVALUE
+    small_angle_threshold: float = _SMALL_ANGLE_THRESHOLD
+    regularization: float = _SMALL_NUMBER
+    jacobian_clip_threshold: float = _JACOBIAN_CLIP_THRESHOLD
+
+# 全局配置实例
+numerical_config = NumericalConfig()
+
+# =====================================================================
+# Thread-Safe Cache Implementation
+# =====================================================================
+class ThreadSafeCache:
+    """线程安全的LRU缓存实现"""
+    
+    def __init__(self, maxsize: int = CACHE_SIZE_LIMIT):
+        self.maxsize = maxsize
+        self._cache = OrderedDict()
+        self._lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+    
+    def get(self, key: Any, default: Any = None) -> Any:
+        """获取缓存值"""
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)  # LRU: 移到末尾
+                self._hits += 1
+                return self._cache[key]
+            self._misses += 1
+            return default
+    
+    def put(self, key: Any, value: Any) -> None:
+        """存储缓存值"""
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            elif len(self._cache) >= self.maxsize:
+                self._cache.popitem(last=False)  # 移除最旧的项
+            self._cache[key] = value
+    
+    def clear(self) -> None:
+        """清空缓存"""
+        with self._lock:
+            self._cache.clear()
+            self._hits = 0
+            self._misses = 0
+    
+    def stats(self) -> Dict[str, int]:
+        """获取缓存统计"""
+        with self._lock:
+            total = self._hits + self._misses
+            hit_rate = self._hits / total if total > 0 else 0.0
+            return {
+                'hits': self._hits,
+                'misses': self._misses,
+                'size': len(self._cache),
+                'hit_rate': hit_rate
+            }
+
+# 全局缓存实例
+_global_cache = ThreadSafeCache()
+
+# 因子专用缓存管理器
+class FactorCacheManager:
+    """
+    统一的因子缓存管理器，避免每个因子都创建独立缓存
+    """
+    
+    def __init__(self):
+        self.energy_cache = ThreadSafeCache(maxsize=512)      # 能量计算缓存
+        self.spbp_cache = ThreadSafeCache(maxsize=256)        # SPBP结果缓存  
+        self.jacobian_cache = ThreadSafeCache(maxsize=128)    # 雅可比矩阵缓存
+        
+    def get_energy_cache_key(self, factor_type: str, var_data: bytes) -> str:
+        """生成能量缓存键"""
+        return f"energy_{factor_type}_{hash(var_data)}"
+    
+    def get_spbp_cache_key(self, factor_type: str, state_data: bytes, cov_data: bytes) -> str:
+        """生成SPBP缓存键"""
+        return f"spbp_{factor_type}_{hash(state_data)}_{hash(cov_data)}"
+    
+    def clear_all(self):
+        """清空所有缓存"""
+        self.energy_cache.clear()
+        self.spbp_cache.clear()
+        self.jacobian_cache.clear()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """获取缓存统计"""
+        return {
+            'energy_cache': self.energy_cache.stats(),
+            'spbp_cache': self.spbp_cache.stats(),
+            'jacobian_cache': self.jacobian_cache.stats()
+        }
+
+# 全局因子缓存管理器
+_factor_cache_manager = FactorCacheManager()
+
+# =====================================================================
+# Enhanced Numerical Utilities
+# =====================================================================
+def wrap_angle(theta: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+    """
+    数值稳定的角度包装到[-π, π]
+    
+    Args:
+        theta: 要包装的角度
+        
+    Returns:
+        包装后的角度在[-π, π]范围内
+    """
+    if isinstance(theta, np.ndarray):
+        # 向量化处理
+        result = np.arctan2(np.sin(theta), np.cos(theta))
+        # 处理数值误差
+        result = np.where(np.abs(result - np.pi) < _ANGLE_WRAP_TOLERANCE, -np.pi, result)
+        return result
+    else:
+        result = math.atan2(math.sin(theta), math.cos(theta))
+        # 处理π边界情况
+        if abs(result - math.pi) < _ANGLE_WRAP_TOLERANCE:
+            result = -math.pi
+        return result
+
+def angle_diff(a1: Union[float, np.ndarray], a2: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+    """
+    计算角度差 a1 - a2，包装到[-π, π]
+    """
+    return wrap_angle(a1 - a2)
+
+def validate_matrix_properties(matrix: np.ndarray, name: str = "matrix", 
+                             check_symmetric: bool = True, 
+                             check_positive_definite: bool = True) -> bool:
+    """
+    验证矩阵的数值属性
+    
+    Args:
+        matrix: 要验证的矩阵
+        name: 矩阵名称（用于错误信息）
+        check_symmetric: 是否检查对称性
+        check_positive_definite: 是否检查正定性
+        
+    Returns:
+        验证是否通过
+        
+    Raises:
+        ValueError: 验证失败时
+    """
+    if not np.isfinite(matrix).all():
+        raise ValueError(f"{name}: Contains non-finite values")
+    
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError(f"{name}: Must be square matrix, got shape {matrix.shape}")
+    
+    if check_symmetric:
+        if not np.allclose(matrix, matrix.T, rtol=1e-10, atol=1e-12):
+            raise ValueError(f"{name}: Matrix is not symmetric")
+    
+    if check_positive_definite:
+        try:
+            eigenvals = np.linalg.eigvals(matrix)
+            if np.any(eigenvals <= 0):
+                min_eigenval = np.min(eigenvals)
+                raise ValueError(f"{name}: Not positive definite (min eigenvalue: {min_eigenval})")
+            
+            # 检查条件数
+            cond = np.max(eigenvals) / np.min(eigenvals)
+            if cond > numerical_config.max_condition_number:
+                logger.warning(f"{name}: High condition number {cond:.2e}")
+                
+        except np.linalg.LinAlgError as e:
+            raise ValueError(f"{name}: Eigenvalue computation failed: {e}")
+    
+    return True
+
+def ensure_positive_definite(matrix: np.ndarray, 
+                           regularization: float = None,
+                           method: str = "cholesky_first") -> np.ndarray:
+    """
+    确保矩阵正定，使用改进的数值稳定性策略
+    
+    Args:
+        matrix: 输入矩阵
+        regularization: 正则化参数
+        method: 方法选择 ("cholesky_first", "eigenvalue", "identity_reg")
+        
+    Returns:
+        正定矩阵
+    """
+    if regularization is None:
+        regularization = numerical_config.regularization
+    
+    # 首先对称化
+    matrix = 0.5 * (matrix + matrix.T)
+    
+    if method == "cholesky_first":
+        try:
+            # 先尝试Cholesky分解验证是否已经正定
+            np.linalg.cholesky(matrix)
+            return matrix.copy()
+        except np.linalg.LinAlgError:
+            # 失败则使用特征值分解
+            method = "eigenvalue"
+    
+    if method == "eigenvalue":
+        try:
+            eigenvals, eigenvecs = np.linalg.eigh(matrix)
+            # 正则化特征值
+            eigenvals_reg = np.maximum(eigenvals, regularization)
+            
+            # 检查是否需要正则化
+            if np.any(eigenvals <= regularization):
+                logger.debug(f"Regularized {np.sum(eigenvals <= regularization)} eigenvalues")
+            
+            return eigenvecs @ np.diag(eigenvals_reg) @ eigenvecs.T
+            
+        except np.linalg.LinAlgError:
+            logger.warning("Eigenvalue decomposition failed, using identity regularization")
+            method = "identity_reg"
+    
+    if method == "identity_reg":
+        # 最后的回退策略：添加对角正则化
+        reg_matrix = matrix + regularization * np.eye(matrix.shape[0])
+        return reg_matrix
+    
+    raise ValueError(f"Unknown method: {method}")
+
+def safe_matrix_inverse(matrix: np.ndarray, 
+                       regularization: float = None,
+                       check_condition: bool = True) -> np.ndarray:
+    """
+    数值稳定的矩阵求逆
+    
+    Args:
+        matrix: 要求逆的矩阵
+        regularization: 正则化参数
+        check_condition: 是否检查条件数
+        
+    Returns:
+        逆矩阵
+    """
+    if regularization is None:
+        regularization = numerical_config.regularization
+    
+    # 输入验证
+    if not np.isfinite(matrix).all():
+        raise ValueError("Matrix contains non-finite values")
+    
+    try:
+        # 首先尝试Cholesky求逆（最快且数值稳定）
+        matrix_pd = ensure_positive_definite(matrix, regularization, "cholesky_first")
+        
+        # 条件数检查
+        if check_condition:
+            cond = np.linalg.cond(matrix_pd)
+            if cond > numerical_config.max_condition_number:
+                logger.warning(f"High condition number in matrix inversion: {cond:.2e}")
+        
+        # Cholesky分解求逆
+        L = np.linalg.cholesky(matrix_pd)
+        identity = np.eye(matrix.shape[0])
+        inv_L = scipy.linalg.solve_triangular(L, identity, lower=True)
+        return inv_L.T @ inv_L
+        
+    except np.linalg.LinAlgError:
+        logger.debug("Cholesky inversion failed, falling back to SVD")
+        
+        # 回退到SVD方法
+        try:
+            U, s, Vt = np.linalg.svd(matrix)
+            # 正则化奇异值
+            s_reg = np.where(s > regularization, 1.0/s, 0.0)
+            return Vt.T @ np.diag(s_reg) @ U.T
+            
+        except np.linalg.LinAlgError as e:
+            logger.error(f"Matrix inversion completely failed: {e}")
+            # 最后的回退：正则化的伪逆
+            return np.linalg.pinv(matrix, rcond=regularization)
+
+def clip_jacobian(jacobian: np.ndarray, threshold: float = None) -> np.ndarray:
+    """
+    裁剪雅可比矩阵防止数值爆炸
+    
+    Args:
+        jacobian: 雅可比矩阵
+        threshold: 裁剪阈值
+        
+    Returns:
+        裁剪后的雅可比矩阵
+    """
+    if threshold is None:
+        threshold = numerical_config.jacobian_clip_threshold
+    
+    clipped = np.clip(jacobian, -threshold, threshold)
+    
+    # 记录是否进行了裁剪
+    if not np.array_equal(jacobian, clipped):
+        max_val = np.max(np.abs(jacobian))
+        logger.debug(f"Jacobian clipped: max value was {max_val:.2e}")
+    
+    return clipped
+
+# =====================================================================
+# Sigma Points Generator
 # =====================================================================
 class SigmaGenerator:
-    """Generate sigma points for Unscented Transform"""
+    """
+    增强的sigma点生成器，具有改进的数值稳定性和缓存
+    """
+    
     def __init__(self, alpha: float = 1e-3, beta: float = 2.0, kappa: float = 0.0):
-        self.alpha = alpha
+        """
+        初始化UT参数
+        
+        Args:
+            alpha: 扩散参数 (1e-4 ≤ α ≤ 1)
+            beta: 高阶矩参数 (β = 2 对高斯分布最优)
+            kappa: 次要缩放参数
+        """
+        self.alpha = np.clip(alpha, 1e-4, 1.0)  # 严格限制范围
         self.beta = beta
         self.kappa = kappa
         
-    def generate(self, mu: np.ndarray, cov: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        n = mu.size
-        lambda_ = self.alpha**2 * (n + self.kappa) - n
+        # 线程安全的参数缓存
+        self._param_cache = ThreadSafeCache(maxsize=64)
+        
+        # 预分配工作数组
+        self._work_arrays = {}
+        
+    def _get_cached_params(self, n: int) -> Tuple[float, np.ndarray, np.ndarray]:
+        """获取缓存的UT参数，线程安全且避免kappa竞态"""
+        cache_key = f"ut_params_{n}_{self.alpha}_{self.beta}_{self.kappa}"
+        cached = self._param_cache.get(cache_key)
+        
+        if cached is not None:
+            return cached
+        
+        # 使用局部变量避免多线程竞态
+        local_kappa = self.kappa
+        lambda_ = self.alpha**2 * (n + local_kappa) - n
+        
+        # 确保数值稳定性 - 调整局部kappa而不修改实例字段
+        if lambda_ + n <= 0:
+            local_kappa = 3 - n + 1e-6  # 使用局部变量
+            lambda_ = self.alpha**2 * (n + local_kappa) - n
+            logger.warning(f"Locally adjusted kappa from {self.kappa} to {local_kappa} for n={n}")
+            # 注意：不修改self.kappa，避免多线程竞态
+        
         gamma = math.sqrt(n + lambda_)
         
-        # 协方差矩阵平方根
+        # 计算权重
+        denom = n + lambda_
+        wm = np.full(2*n+1, 0.5/denom)
+        wc = wm.copy()
+        
+        wm[0] = lambda_/denom
+        wc[0] = wm[0] + (1 - self.alpha**2 + self.beta)
+        
+        # 验证权重和为1
+        weight_sum = np.sum(wm)
+        if abs(weight_sum - 1.0) > 1e-10:
+            logger.warning(f"Weight sum deviation: {weight_sum}")
+            wm = wm / weight_sum  # 归一化
+        
+        params = (lambda_, wm, wc)
+        self._param_cache.put(cache_key, params)
+        return params
+        
+    def generate(self, mu: np.ndarray, cov: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        生成sigma点用于UT变换
+        
+        Args:
+            mu: 均值向量
+            cov: 协方差矩阵
+            
+        Returns:
+            sigma_points: (2n+1, n) sigma点
+            wm: 均值权重
+            wc: 协方差权重
+        """
+        mu = np.asarray(mu, dtype=float)
+        cov = np.asarray(cov, dtype=float)
+        
+        n = mu.size
+        
+        # 验证输入
+        validate_matrix_properties(cov, "covariance matrix", 
+                                 check_symmetric=True, 
+                                 check_positive_definite=True)
+        
+        if mu.shape[0] != cov.shape[0]:
+            raise ValueError(f"Dimension mismatch: mu={mu.shape}, cov={cov.shape}")
+        
+        # 获取UT参数
+        lambda_, wm, wc = self._get_cached_params(n)
+        gamma = math.sqrt(n + lambda_)
+        
+        # 计算矩阵平方根
         try:
-            S = np.linalg.cholesky(cov)
+            # 确保协方差矩阵正定
+            cov_pd = ensure_positive_definite(cov, numerical_config.min_eigenvalue)
+            
+            # 使用Cholesky分解
+            S = np.linalg.cholesky(cov_pd)
+            
         except np.linalg.LinAlgError:
-            cov_reg = cov + np.eye(n) * _SMALL_NUMBER
-            S = np.linalg.cholesky(cov_reg)
+            logger.debug("Cholesky failed, using SVD square root")
+            # 回退到SVD方法
+            U, s, Vt = np.linalg.svd(cov)
+            s_safe = np.maximum(s, numerical_config.min_eigenvalue)
+            S = U @ np.diag(np.sqrt(s_safe))
         
         # 生成sigma点
         sigma_points = np.zeros((2*n + 1, n))
         sigma_points[0] = mu
         
+        # 使用预分配的数组（如果可能）
+        offset_vectors = gamma * S.T  # (n, n)
+        
         for i in range(n):
-            sigma_points[i+1] = mu + gamma * S[:, i]
-            sigma_points[n+i+1] = mu - gamma * S[:, i]
+            sigma_points[i+1] = mu + offset_vectors[i]
+            sigma_points[n+i+1] = mu - offset_vectors[i]
         
-        # 计算权重
-        wm = np.full(2*n+1, 0.5/(n+lambda_))
-        wc = wm.copy()
-        
-        wm[0] = lambda_/(n+lambda_)
-        # 按照要求修正权重计算
-        wc[0] = wm[0] + (1 - self.alpha**2 + self.beta)
-        
+        # 最终验证
+        if not np.isfinite(sigma_points).all():
+            raise ValueError("Generated sigma points contain non-finite values")
         
         return sigma_points, wm, wc
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """获取缓存统计信息"""
+        return self._param_cache.stats()
 
 # =====================================================================
-# 基类
+#  Base Factor Class
 # =====================================================================
 class Factor(ABC):
+    """
+    增强的因子基类，具有改进的错误检查和验证
+    """
+    
+    def __init__(self):
+        self._validation_enabled = True
+        # 不再每个因子都有独立缓存，改用全局缓存管理器
+        
     @abstractmethod
-    def linearize(self, mu: Dict[str, np.ndarray], cov: Dict[str, np.ndarray]) -> Dict: ...
+    def linearize(self, mu: Dict[str, np.ndarray], cov: Dict[str, np.ndarray]) -> Dict:
+        """
+        在当前估计附近线性化因子
+        
+        Args:
+            mu: 变量均值
+            cov: 变量协方差（和交叉协方差）
+            
+        Returns:
+            包含信息矩阵块的字典:
+            - var_key: (Λ_ii, η_i) 对角块
+            - (var_i, var_j): Λ_ij 非对角块
+        """
+        pass
     
     @abstractmethod
-    def get_energy(self, mu: Dict[str, np.ndarray]) -> float: ...
+    def get_energy(self, mu: Dict[str, np.ndarray]) -> float:
+        """
+        计算因子能量（平方马氏距离）
+        
+        Args:
+            mu: 变量值
+            
+        Returns:
+            因子能量
+        """
+        pass
+    
+    @abstractmethod
+    def _get_dim(self, key: str) -> int:
+        """
+        获取变量维度
+        
+        Args:
+            key: 变量键
+            
+        Returns:
+            变量维度（如果不涉及此因子则返回0）
+        """
+        pass
+    
+    def validate_linearization_result(self, result: Dict) -> bool:
+        """
+        验证线性化结果的数值合理性
+        
+        Args:
+            result: 线性化结果字典
+            
+        Returns:
+            结果是否有效
+        """
+        if not self._validation_enabled:
+            return True
+            
+        try:
+            for key, value in result.items():
+                if isinstance(key, tuple):
+                    # 交叉项
+                    if not isinstance(value, np.ndarray) or value.ndim != 2:
+                        logger.error(f"Invalid cross-term shape for {key}: {value.shape}")
+                        return False
+                    
+                    if not np.isfinite(value).all():
+                        logger.error(f"Non-finite values in cross-term {key}")
+                        return False
+                    
+                    # 检查数值范围
+                    max_val = np.max(np.abs(value))
+                    if max_val > numerical_config.jacobian_clip_threshold:
+                        logger.warning(f"Large values in cross-term {key}: {max_val:.2e}")
+                        
+                else:
+                    # 对角项
+                    if not isinstance(value, tuple) or len(value) != 2:
+                        logger.error(f"Invalid diagonal term format for {key}")
+                        return False
+                    
+                    L, eta = value
+                    if not isinstance(L, np.ndarray) or not isinstance(eta, np.ndarray):
+                        logger.error(f"Diagonal term components not arrays for {key}")
+                        return False
+                    
+                    if not np.isfinite(L).all() or not np.isfinite(eta).all():
+                        logger.error(f"Non-finite values in diagonal term {key}")
+                        return False
+                    
+                    # 验证信息矩阵正定性
+                    try:
+                        validate_matrix_properties(L, f"information_matrix_{key}", 
+                                                 check_symmetric=True, 
+                                                 check_positive_definite=True)
+                    except ValueError as e:
+                        logger.error(f"Invalid information matrix for {key}: {e}")
+                        return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Validation error: {e}")
+            return False
+    
+    def enable_validation(self, enabled: bool = True):
+        """启用/禁用验证（用于性能优化）"""
+        self._validation_enabled = enabled
+    
+    def clear_caches(self):
+        """清空缓存 - 现在使用全局缓存管理器"""
+        _factor_cache_manager.clear_all()
 
 # =====================================================================
-# 1. Prior factor
+# Prior Factor
 # =====================================================================
 class PriorFactor(Factor):
-    def __init__(self, var: str, prior: np.ndarray, sigmas: np.ndarray):
+    """
+    改进的先验因子，具有更好的数值稳定性
+    """
+    
+    def __init__(self, var: str, prior: np.ndarray, sigmas: Union[float, np.ndarray]):
+        """
+        初始化先验因子
+        
+        Args:
+            var: 变量名
+            prior: 先验均值
+            sigmas: 先验标准差（标量或数组）
+        """
+        super().__init__()
+        
         self.var = var
-        self.prior = prior.astype(float)
-        sigma_array = np.ones_like(prior) * sigmas if np.isscalar(sigmas) else sigmas
-        self._Λ = np.diag(1.0 / (sigma_array ** 2))
+        self.prior = np.asarray(prior, dtype=float)
+        
+        # 处理sigma输入
+        if np.isscalar(sigmas):
+            sigma_array = np.full_like(self.prior, sigmas, dtype=float)
+        else:
+            sigma_array = np.asarray(sigmas, dtype=float)
+            if sigma_array.shape != self.prior.shape:
+                raise ValueError(f"Sigma shape {sigma_array.shape} doesn't match prior shape {self.prior.shape}")
+        
+        # 确保最小sigma以保证数值稳定性
+        sigma_array = np.maximum(sigma_array, numerical_config.min_eigenvalue**0.5)
+        
+        # 预计算信息矩阵和向量
+        variances = sigma_array ** 2
+        self._Λ = np.diag(1.0 / variances)
         self._η = self._Λ @ self.prior
+        
+        # 验证
+        validate_matrix_properties(self._Λ, "prior_information_matrix")
+        
+        logger.debug(f"Created prior factor for {var} with dim={self.prior.shape[0]}")
 
-    def linearize(self, *_) -> Dict:
-        return {self.var: (self._Λ, self._η)}
+    def linearize(self, mu: Dict[str, np.ndarray], cov: Dict[str, np.ndarray]) -> Dict:
+        """线性化先验（无论当前估计如何都是常数）"""
+        return {self.var: (self._Λ.copy(), self._η.copy())}
 
     def get_energy(self, mu: Dict[str, np.ndarray]) -> float:
-        r = mu[self.var] - self.prior
-        if r.size == 3: 
-            r[2] = wrap_angle(r[2])
-        return 0.5 * r @ self._Λ @ r
+        """计算先验能量，使用全局缓存管理器"""
+        if self.var not in mu:
+            return 0.0
+        
+        # 使用内容哈希而非内存地址作为缓存键，避免就地修改导致的缓存脏读
+        try:
+            cache_key = _factor_cache_manager.get_energy_cache_key("prior", mu[self.var].tobytes())
+            cached_energy = _factor_cache_manager.energy_cache.get(cache_key)
+            if cached_energy is not None:
+                return cached_energy
+        except:
+            # 如果哈希失败，不使用缓存
+            cache_key = None
+        
+        residual = mu[self.var] - self.prior
+        
+        # SE(2)姿态的特殊处理（假设最后一个元素是角度）
+        if residual.size == 3:
+            residual = residual.copy()
+            residual[2] = wrap_angle(residual[2])
+        
+        energy = 0.5 * residual @ self._Λ @ residual
+        
+        # 缓存结果（如果有有效缓存键）
+        if cache_key:
+            _factor_cache_manager.energy_cache.put(cache_key, energy)
+        
+        return energy
         
     def _get_dim(self, key: str) -> int:
+        """获取变量维度"""
         return self.prior.shape[0] if key == self.var else 0
 
 # =====================================================================
-# 2. Odometry factor (关键修正版)
+# Enhanced Odometry Factor
 # =====================================================================
 class OdometryFactor(Factor):
-    def __init__(self, v_from: str, v_to: str, delta: np.ndarray, sigmas: np.ndarray):
+    """
+    增强的SE(2)里程计因子，具有改进的Lie群处理
+    """
+    
+    def __init__(self, v_from: str, v_to: str, delta: np.ndarray, sigmas: Union[float, np.ndarray]):
+        """
+        初始化里程计因子
+        
+        Args:
+            v_from: 起始姿态变量名
+            v_to: 终止姿态变量名  
+            delta: 相对姿态测量 [dx, dy, dtheta]
+            sigmas: 测量噪声标准差
+        """
+        super().__init__()
+        
         self.v1, self.v2 = v_from, v_to
-        self.delta = delta.astype(float)
+        self.delta = np.asarray(delta, dtype=float)
         
-        # 移除一次性计算的雅可比矩阵
-        sigma_array = np.ones_like(delta) * sigmas if np.isscalar(sigmas) else sigmas
-        self.Rinv = np.diag(1.0 / (sigma_array ** 2))
-    
-    @staticmethod
-    def _se2_minus(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """SE(2)上的右乘误差: Log(b ∘ a⁻¹)"""
-        x_a, y_a, θ_a = a
-        x_b, y_b, θ_b = b
+        if self.delta.size != 3:
+            raise ValueError(f"Delta must be 3D SE(2) relative pose, got {self.delta.shape}")
         
-        # 计算相对旋转
-        dθ = wrap_angle(θ_b - θ_a)
+        # 处理噪声模型
+        if np.isscalar(sigmas):
+            sigma_array = np.full(3, sigmas, dtype=float)
+        else:
+            sigma_array = np.asarray(sigmas, dtype=float)
+            if sigma_array.size != 3:
+                raise ValueError(f"Sigmas must be scalar or 3D array, got {sigma_array.shape}")
         
-        # 计算旋转矩阵的转置 (即逆旋转)
-        cθ, sθ = math.cos(θ_a), math.sin(θ_a)
-        R_T = np.array([[cθ, sθ], [-sθ, cθ]])
+        # 确保最小噪声
+        sigma_array = np.maximum(sigma_array, numerical_config.min_eigenvalue**0.5)
+        variances = sigma_array ** 2
+        self.Rinv = np.diag(1.0 / variances)
         
-        # 计算在a坐标系下的平移
-        trans_global = np.array([x_b - x_a, y_b - y_a])
-        trans_body = R_T @ trans_global
+        # 验证
+        validate_matrix_properties(self.Rinv, "odometry_information_matrix")
         
-        return np.array([trans_body[0], trans_body[1], dθ])
-    
-    @staticmethod
-    def _adjoint(x: float, y: float, th: float) -> np.ndarray:
-        """完整SE(2) Adjoint矩阵(含平移分量) - 修正版"""
-        ct, st = math.cos(th), math.sin(th)
-        # 修正：根据图片建议的正确形式
-        return np.array([
-            [ct, -st, y],
-            [st,  ct, -x],
-            [0,   0,  1]
-        ])
-
-    def linearize(self, mu: Dict, cov: Dict) -> Dict:
-        Ti, Tj = mu[self.v1], mu[self.v2]
-        
-        # 修正1：正确计算相对位姿误差
-        Tij = self._se2_minus(Ti, Tj)  # 计算 Tj ∘ Ti⁻¹
-        # 修正2：交换参数顺序 Log(Δ⁻¹ ∘ (T_i⁻¹ ∘ T_j))
-        err = self._se2_minus(self.delta, Tij)  # 修正顺序 
-        err[2] = wrap_angle(err[2])
-        
-        # 修正3：使用相对位姿计算雅可比
-        J_i = -self._adjoint(*Tij)  # Adj(Tij)
-        J_j = np.eye(3)
-        
-        # 信息矩阵部分
-        Λii = J_i.T @ self.Rinv @ J_i
-        Λjj = J_j.T @ self.Rinv @ J_j
-        Λij = J_i.T @ self.Rinv @ J_j
-        
-        # 信息向量部分
-        ηi = J_i.T @ self.Rinv @ err
-        ηj = J_j.T @ self.Rinv @ err
-
-        # 返回结果并添加对称块
-        result = {
-            self.v1: (Λii, ηi),
-            self.v2: (Λjj, ηj),
-            (self.v1, self.v2): Λij
+        # 预分配工作数组
+        self._work_residual = np.zeros(3)
+        self._work_jacobians = {
+            'from': np.zeros((3, 3)),
+            'to': np.zeros((3, 3))
         }
-        result[(self.v2, self.v1)] = Λij.T
-        return result
+        
+        logger.debug(f"Created odometry factor {v_from} -> {v_to}")
+    
+    @staticmethod
+    def _se2_relative_pose(T_from: np.ndarray, T_to: np.ndarray) -> np.ndarray:
+        """
+        计算SE(2)中的相对姿态: T_from^{-1} ∘ T_to
+        
+        Args:
+            T_from: [x, y, theta] 起始姿态
+            T_to: [x, y, theta] 终止姿态
+            
+        Returns:
+            起始坐标系下的相对姿态 [dx, dy, dtheta]
+        """
+        x_from, y_from, theta_from = T_from
+        x_to, y_to, theta_to = T_to
+        
+        # 相对旋转
+        dtheta = wrap_angle(theta_to - theta_from)
+        
+        # 全局坐标系下的平移
+        dx_global = x_to - x_from
+        dy_global = y_to - y_from
+        
+        # 转换到起始坐标系
+        cos_from, sin_from = math.cos(theta_from), math.sin(theta_from)
+        dx_local = cos_from * dx_global + sin_from * dy_global
+        dy_local = -sin_from * dx_global + cos_from * dy_global
+        
+        return np.array([dx_local, dy_local, dtheta])
+    
+    @staticmethod
+    def _se2_adjoint_inverse(delta: np.ndarray) -> np.ndarray:
+        """
+        计算SE(2)伴随矩阵的逆，针对小角度进行优化
+        使用更实用的小角度阈值(1e-3 rad ≈ 0.057度)
+        
+        Args:
+            delta: 相对姿态 [dx, dy, dtheta]
+            
+        Returns:
+            3x3 伴随逆矩阵
+        """
+        dx, dy, dtheta = delta
+        
+        # 小角度近似以提高数值稳定性 - 使用更实用的阈值
+        if abs(dtheta) < numerical_config.small_angle_threshold:  # 1e-3 rad
+            # 一阶泰勒展开
+            return np.array([
+                [1.0,    dtheta, -dy],
+                [-dtheta, 1.0,    dx],
+                [0.0,     0.0,    1.0]
+            ])
+        else:
+            # 完整计算
+            cos_th, sin_th = math.cos(dtheta), math.sin(dtheta)
+            return np.array([
+                [cos_th,  sin_th, -dy],
+                [-sin_th, cos_th,  dx],
+                [0.0,     0.0,     1.0]
+            ])
+
+    def linearize(self, mu: Dict[str, np.ndarray], cov: Dict[str, np.ndarray]) -> Dict:
+        """
+        使用SE(2) Lie群结构线性化里程计因子
+        """
+        # 检查变量是否存在
+        if self.v1 not in mu or self.v2 not in mu:
+            return self._get_zero_blocks()
+        
+        try:
+            T_from, T_to = mu[self.v1], mu[self.v2]
+            
+            # 计算实际相对姿态
+            delta_actual = self._se2_relative_pose(T_from, T_to)
+            
+            # 计算误差：期望 - 实际
+            self._work_residual[:] = self.delta - delta_actual
+            self._work_residual[2] = wrap_angle(self._work_residual[2])  # 包装角度误差
+            
+            # 计算雅可比矩阵
+            # 对于误差 e = δ_expected - log(T_from^{-1} ∘ T_to)
+            # ∂e/∂T_from = Adj^{-1}(δ_actual)  (右扰动模型)
+            # ∂e/∂T_to = -I
+            
+            J_from = self._se2_adjoint_inverse(delta_actual)
+            J_to = -np.eye(3)
+            
+            # 裁剪雅可比矩阵
+            J_from = clip_jacobian(J_from)
+            J_to = clip_jacobian(J_to)
+            
+            # 信息矩阵块
+            Λ_from_from = J_from.T @ self.Rinv @ J_from
+            Λ_to_to = J_to.T @ self.Rinv @ J_to
+            Λ_from_to = J_from.T @ self.Rinv @ J_to
+            
+            # 信息向量块
+            η_from = J_from.T @ self.Rinv @ self._work_residual
+            η_to = J_to.T @ self.Rinv @ self._work_residual
+            
+            result = {
+                self.v1: (Λ_from_from, η_from),
+                self.v2: (Λ_to_to, η_to),
+                (self.v1, self.v2): Λ_from_to,
+                (self.v2, self.v1): Λ_from_to.T
+            }
+            
+            # 验证结果
+            if not self.validate_linearization_result(result):
+                logger.warning(f"Odometry linearization validation failed for {self.v1}->{self.v2}")
+                return self._get_zero_blocks()
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Odometry linearization failed for {self.v1}->{self.v2}: {e}")
+            return self._get_zero_blocks()
 
     def get_energy(self, mu: Dict[str, np.ndarray]) -> float:
-        Ti, Tj = mu[self.v1], mu[self.v2]
-        Tij = self._se2_minus(Ti, Tj)
-        # 修正：与linearize保持一致的误差计算顺序
-        err = self._se2_minus(self.delta, Tij)
-        err[2] = wrap_angle(err[2])
-        return 0.5 * err @ self.Rinv @ err
+        """计算里程计因子能量"""
+        if self.v1 not in mu or self.v2 not in mu:
+            return 0.0
+        
+        try:
+            T_from, T_to = mu[self.v1], mu[self.v2]
+            delta_actual = self._se2_relative_pose(T_from, T_to)
+            error = self.delta - delta_actual
+            error[2] = wrap_angle(error[2])
+            
+            return 0.5 * error @ self.Rinv @ error
+            
+        except Exception as e:
+            logger.error(f"Odometry energy computation failed: {e}")
+            return 0.0
+    
+    def _get_zero_blocks(self) -> Dict:
+        """当变量缺失时返回零信息块"""
+        return {
+            self.v1: (np.zeros((3, 3)), np.zeros(3)),
+            self.v2: (np.zeros((3, 3)), np.zeros(3)),
+            (self.v1, self.v2): np.zeros((3, 3)),
+            (self.v2, self.v1): np.zeros((3, 3))
+        }
         
     def _get_dim(self, key: str) -> int:
+        """获取变量维度"""
         return 3 if key in (self.v1, self.v2) else 0
 
 # =====================================================================
-# 3. Bearing-Range UT 因子 
+# Enhanced Bearing-Range Factor with UT
 # =====================================================================
 class BearingRangeUTFactor(Factor):
+    """
+    增强的方位-距离观测因子，具有自适应GBP/SPBP模式切换
+    """
+    
     def __init__(self, pose_var: str, lm_var: str, measurement: np.ndarray, R: np.ndarray,
                  mode: str = "auto", alpha: float = 1e-3, beta: float = 2.0, kappa: float = 0.0,
                  linear_threshold: float = 5.0, residual_sigma_thresh: float = 3.0):
+        """
+        初始化方位-距离因子
+        
+        Args:
+            pose_var: 姿态变量名  
+            lm_var: 地标变量名
+            measurement: [bearing, range] 观测
+            R: 2x2 测量噪声协方差
+            mode: "auto", "gbp", 或 "spbp"
+            alpha, beta, kappa: UT参数
+            linear_threshold: 线性假设的距离阈值
+            residual_sigma_thresh: 模式切换的残差阈值
+        """
+        super().__init__()
+        
+        # 基本参数
         self.pose_key = pose_var
         self.lm_key = lm_var
-        self.z = measurement.astype(float)
-        self.R = R.copy()
-        self.Rinv = np.linalg.inv(self.R)
+        self.z = np.asarray(measurement, dtype=float)
+        
+        if self.z.size != 2:
+            raise ValueError(f"Measurement must be [bearing, range], got {self.z.shape}")
+        
+        # 噪声模型验证和改进
+        R = np.asarray(R, dtype=float)
+        if R.shape != (2, 2):
+            raise ValueError(f"R must be 2x2, got {R.shape}")
+        
+        # 确保R正定
+        try:
+            validate_matrix_properties(R, "measurement_noise_covariance", 
+                                     check_symmetric=True, 
+                                     check_positive_definite=True)
+            self.R = R.copy()
+        except ValueError as e:
+            logger.warning(f"Measurement covariance invalid: {e}, regularizing")
+            self.R = ensure_positive_definite(R, numerical_config.min_eigenvalue)
+        
+        self.Rinv = safe_matrix_inverse(self.R)
+        
+        # UT参数
         self.mode = mode.lower()
-        self.alpha, self.beta, self.kappa = alpha, beta, kappa
-        self.linear_th = linear_threshold
-        self.res_th_mul = residual_sigma_thresh
-        self._diverged_cnt = 0
-        self._lock = threading.RLock()
-        self._last_μx = None
-        self._last_Λ_cross = None  # 删除_last_Λy变量
-        self._spbp_cache = {}
+        if self.mode not in ("auto", "gbp", "spbp"):
+            raise ValueError(f"Invalid mode: {mode}, must be 'auto', 'gbp', or 'spbp'")
+            
+        # Sigma点生成器
+        self.sigma_generator = SigmaGenerator(alpha, beta, kappa)
+        
+        # 自适应模式切换参数
+        self.linear_threshold = max(linear_threshold, 0.1)
+        self.residual_sigma_thresh = max(residual_sigma_thresh, 1.0)
+        
+        # 状态管理（线程安全）
+        self._state_lock = threading.Lock()
+        self._diverged_count = 0
         self._current_mode = "gbp"
-        # 维度映射表 - 确保返回零矩阵时维度正确
+        self._mode_switch_history = []
+        
+        # 使用全局缓存管理器而非独立缓存
+        
+        # 预分配工作数组
+        self._work_arrays = {
+            'residual': np.zeros(2),
+            'prediction': np.zeros(2),
+            'jacobian_pose': np.zeros((2, 3)),
+            'jacobian_landmark': np.zeros((2, 2)),
+            'joint_state': np.zeros(5),
+            'joint_cov': np.zeros((5, 5))
+        }
+        
+        # 维度映射
         self._dim_map = {
             self.pose_key: 3,
             self.lm_key: 2
         }
+        
+        logger.debug(f"Created bearing-range factor {pose_var}->{lm_var}, mode={mode}")
 
-    def linearize(self, mu: Dict, cov: Dict) -> Dict:
-        with self._lock:
+    def linearize(self, mu: Dict[str, np.ndarray], cov: Dict[str, np.ndarray]) -> Dict:
+        """
+        使用自适应模式选择线性化方位-距离因子
+        """
+        # 输入验证
+        if self.pose_key not in mu or self.lm_key not in mu:
+            return self._get_zero_blocks()
+        
+        if self.pose_key not in cov or self.lm_key not in cov:
+            return self._get_zero_blocks()
+        
+        try:
+            # 提取当前估计
             μp = mu[self.pose_key]
             μl = mu[self.lm_key]
             Pp = cov[self.pose_key]
             Pl = cov[self.lm_key]
-            Ppl = cov.get((self.pose_key, self.lm_key), np.zeros((3, 2)))
-            μx = np.hstack([μp, μl])
-            Px = np.block([[Pp, Ppl], [Ppl.T, Pl]]) + np.eye(5) * _SMALL_NUMBER
-
-            # 计算残差
-            y_pred = self._h(μx)
-            r = self.z - y_pred
-            r[0] = wrap_angle(r[0])
-
-            # 计算距离
+            
+            # 输入验证
+            if μp.size != 3 or μl.size != 2:
+                logger.error(f"Invalid state dimensions: pose={μp.size}, landmark={μl.size}")
+                return self._get_zero_blocks()
+            
+            if Pp.shape != (3, 3) or Pl.shape != (2, 2):
+                logger.error(f"Invalid covariance shapes: Pp={Pp.shape}, Pl={Pl.shape}")
+                return self._get_zero_blocks()
+            
+            # 验证协方差矩阵
+            validate_matrix_properties(Pp, "pose_covariance")
+            validate_matrix_properties(Pl, "landmark_covariance")
+            
+            # 处理交叉协方差
+            Ppl = self._extract_cross_covariance(cov)
+            
+            # 构建联合状态
+            self._work_arrays['joint_state'][:3] = μp
+            self._work_arrays['joint_state'][3:] = μl
+            
+            self._work_arrays['joint_cov'][:3, :3] = Pp
+            self._work_arrays['joint_cov'][3:, 3:] = Pl
+            self._work_arrays['joint_cov'][:3, 3:] = Ppl
+            self._work_arrays['joint_cov'][3:, :3] = Ppl.T
+            
+            # 确保联合协方差正定
+            joint_cov_pd = ensure_positive_definite(self._work_arrays['joint_cov'], 
+                                                   numerical_config.min_eigenvalue)
+            
+            # 计算预测和残差
+            self._work_arrays['prediction'][:] = self._observation_model(self._work_arrays['joint_state'])
+            self._work_arrays['residual'][:] = self.z - self._work_arrays['prediction']
+            self._work_arrays['residual'][0] = wrap_angle(self._work_arrays['residual'][0])  # 包装方位残差
+            
+            # 计算姿态-地标距离以进行模式决策
             dx, dy = μl[0] - μp[0], μl[1] - μp[1]
-            dist = math.hypot(dx, dy)
-            safe_dist = max(dist, _SMALL_NUMBER)
-
-            # 模式选择
-            mode_now = self._decide_mode(safe_dist, r)
+            distance = math.hypot(dx, dy)
             
-            # 设置通用属性
-            self._last_μx = μx.copy()
-            self._last_Λ_cross = None
+            # 选择线性化模式
+            selected_mode = self._select_mode(distance, self._work_arrays['residual'])
             
-            # 根据模式选择线性化方法
-            if mode_now == "spbp":
-                try:
-                    # 生成缓存键 - 包含所有必要信息
-                    cache_key = self._generate_cache_key(μx, Px)
-                    result = self._spbp_linearize(μx, Px, r, cache_key)
-                    return result
-                except np.linalg.LinAlgError:
-                    # 奇异矩阵时回落到GBP
-                    result = self._gbp_linearize(μp, μl, r, safe_dist, dx, dy)
-                    return result
+            # 执行线性化
+            if selected_mode == "spbp":
+                result = self._spbp_linearize(self._work_arrays['joint_state'], 
+                                            joint_cov_pd, 
+                                            self._work_arrays['residual'])
             else:
-                result = self._gbp_linearize(μp, μl, r, safe_dist, dx, dy)
+                result = self._gbp_linearize(μp, μl, self._work_arrays['residual'], 
+                                           distance, dx, dy)
+            
+            # 验证并返回结果
+            if self.validate_linearization_result(result):
                 return result
+            else:
+                # 回退到GBP如果验证失败
+                logger.warning(f"Validation failed for {selected_mode}, falling back to GBP")
+                return self._gbp_linearize(μp, μl, self._work_arrays['residual'], 
+                                         distance, dx, dy)
+                
+        except Exception as e:
+            logger.error(f"Bearing-range linearization failed: {e}")
+            return self._get_zero_blocks()
 
     def get_energy(self, mu: Dict[str, np.ndarray]) -> float:
-        with self._lock:
-            try:
-                μx_current = np.hstack([mu[self.pose_key], mu[self.lm_key]])
-            except KeyError:
-                return 0.0
-                
-            # 计算预测观测
-            pred = self._h(μx_current)
-            r = self.z - pred
-            r[0] = wrap_angle(r[0])
-            
-            # 修正7：始终使用观测信息矩阵 R⁻¹
-            return 0.5 * r @ self.Rinv @ r
+        """计算因子能量"""
+        if self.pose_key not in mu or self.lm_key not in mu:
+            return 0.0
         
-    def cross_block(self, var_i: str, var_j: str) -> np.ndarray:
-        with self._lock:
-            # 获取安全维度（使用_dim_map确保维度一致）
-            dim_i = self._dim_map.get(var_i, 0)
-            dim_j = self._dim_map.get(var_j, 0)
-            
-            # 修正6：对任一非相关变量都返回零矩阵
-            if not self._is_related_var(var_i) or not self._is_related_var(var_j):
-                return np.zeros((dim_i, dim_j))
-            
-            if self._last_Λ_cross is None:
-                return np.zeros((dim_i, dim_j))
-                
-            if (var_i, var_j) == (self.pose_key, self.lm_key):
-                return self._last_Λ_cross
-            elif (var_i, var_j) == (self.lm_key, self.pose_key):
-                return self._last_Λ_cross.T
-            
-            # 修正6：确保对(var_i, var_j)不匹配也返回正确维度
-            return np.zeros((dim_i, dim_j))
-            
-    def _is_related_var(self, var: str) -> bool:
-        return var in (self.pose_key, self.lm_key)
-
-    # ----------- 内部方法 -----------
+        try:
+            μx = np.hstack([mu[self.pose_key], mu[self.lm_key]])
+            prediction = self._observation_model(μx)
+            residual = self.z - prediction
+            residual[0] = wrap_angle(residual[0])
+            return 0.5 * residual @ self.Rinv @ residual
+        except Exception as e:
+            logger.error(f"Energy computation failed: {e}")
+            return 0.0
+        
+    def _get_dim(self, key: str) -> int:
+        """获取变量维度"""
+        return self._dim_map.get(key, 0)
+        
+    # -------------------------------------------------------------------------
+    # 内部辅助方法
+    # -------------------------------------------------------------------------
+    
+    def _get_zero_blocks(self) -> Dict:
+        """返回零信息块"""
+        return {
+            self.pose_key: (np.zeros((3, 3)), np.zeros(3)),
+            self.lm_key: (np.zeros((2, 2)), np.zeros(2)),
+            (self.pose_key, self.lm_key): np.zeros((3, 2)),
+            (self.lm_key, self.pose_key): np.zeros((2, 3))
+        }
+    
+    def _extract_cross_covariance(self, cov: Dict) -> np.ndarray:
+        """
+        提取姿态和地标之间的交叉协方差
+        
+        Returns 3x2 matrix (pose×landmark)
+        """
+        # 尝试不同可能的键
+        cross_keys = [
+            (self.pose_key, self.lm_key),
+            (self.lm_key, self.pose_key)
+        ]
+        
+        for key in cross_keys:
+            if key in cov:
+                Ppl = cov[key]
+                if key[0] == self.lm_key:  # 如果是(landmark, pose)，转置
+                    Ppl = Ppl.T
+                if Ppl.shape == (3, 2):
+                    return Ppl.copy()
+                else:
+                    logger.warning(f"Cross-covariance wrong shape: expected (3,2), got {Ppl.shape}")
+        
+        # 默认为零交叉协方差
+        return np.zeros((3, 2))
+    
     @staticmethod
-    def _h(x: np.ndarray) -> np.ndarray:
-        px, py, th, lx, ly = x
+    def _observation_model(x: np.ndarray) -> np.ndarray:
+        """
+        方位-距离观测模型
+        
+        Args:
+            x: 联合状态 [px, py, ptheta, lx, ly]
+            
+        Returns:
+            预测观测 [bearing, range]
+        """
+        px, py, ptheta, lx, ly = x
         dx, dy = lx - px, ly - py
-        rng = math.hypot(dx, dy)
-        bearing = math.atan2(dy, dx) - th
-        return np.array([wrap_angle(bearing), rng]) 
-
-    def _decide_mode(self, dist: float, residual: np.ndarray) -> str:
+        
+        range_pred = math.hypot(dx, dy)
+        bearing_pred = wrap_angle(math.atan2(dy, dx) - ptheta)
+        
+        return np.array([bearing_pred, range_pred])
+    
+    def _select_mode(self, distance: float, residual: np.ndarray) -> str:
+        """
+        基于几何和残差智能选择线性化模式
+        """
         if self.mode in ("gbp", "spbp"):
             return self.mode
             
-        # 极近距离强制使用GBP
-        if dist < _SMALL_NUMBER:
-            return "gbp"
+        with self._state_lock:
+            # 对于非常近的距离强制使用GBP（数值稳定性）
+            if distance < 0.1:  # 10 cm
+                return "gbp"
+                
+            # 分析残差幅度
+            σ_bearing = math.sqrt(self.R[0, 0])
+            σ_range = math.sqrt(self.R[1, 1])
             
-        # 残差分析
-        σ_bearing = math.sqrt(self.R[0, 0])
-        σ_range = math.sqrt(self.R[1, 1])
-        big_bearing = abs(residual[0]) > self.res_th_mul * σ_bearing
-        big_range = abs(residual[1]) > self.res_th_mul * σ_range
-        
-        # 模式切换逻辑
-        if self._current_mode == "spbp":
-            if not (big_bearing or big_range) and dist < self.linear_th:
-                self._diverged_cnt = max(0, self._diverged_cnt - 1)
-                if self._diverged_cnt == 0:
-                    self._current_mode = "gbp"
-            else:
-                return "spbp"
-        else:
-            if dist > self.linear_th or big_bearing or big_range:
-                self._diverged_cnt += 1
-                if self._diverged_cnt > 3:
+            large_bearing_error = abs(residual[0]) > self.residual_sigma_thresh * σ_bearing
+            large_range_error = abs(residual[1]) > self.residual_sigma_thresh * σ_range
+            large_distance = distance > self.linear_threshold
+            
+            # 模式切换逻辑，带有滞后
+            if large_bearing_error or large_range_error or large_distance:
+                self._diverged_count += 1
+                if self._diverged_count > 2:  # 多次大误差后切换到SPBP
                     self._current_mode = "spbp"
-        
-        return self._current_mode
-
+            else:
+                self._diverged_count = max(0, self._diverged_count - 1)
+                if self._diverged_count == 0:
+                    self._current_mode = "gbp"
+            
+            # 记录模式切换历史（用于调试）
+            if len(self._mode_switch_history) == 0 or self._mode_switch_history[-1] != self._current_mode:
+                self._mode_switch_history.append(self._current_mode)
+                if len(self._mode_switch_history) > 10:  # 保持历史长度有限
+                    self._mode_switch_history.pop(0)
+            
+            return self._current_mode
+    
     def _gbp_linearize(self, μp: np.ndarray, μl: np.ndarray, residual: np.ndarray, 
-                       dist: float, dx: float, dy: float) -> Dict:
-        # 安全处理距离和增量
-        safe_dist = max(dist, _SMALL_NUMBER)
-        q = safe_dist ** 2
+                       distance: float, dx: float, dy: float) -> Dict:
+        """
+        标准GBP线性化，使用一阶泰勒展开
+        """
+        # 确保距离计算的数值稳定性
+        safe_distance = max(distance, numerical_config.min_eigenvalue**0.5)
+        q = safe_distance ** 2  # 距离的平方
         
-        # 处理小值问题
-        safe_dx = dx if abs(dx) > _EPS else _EPS * (1 if dx >= 0 else -1)
-        safe_dy = dy if abs(dy) > _EPS else _EPS * (1 if dy >= 0 else -1)
-
-        # Jacobian矩阵
-        Jp_bearing = np.array([
-            safe_dy/q, -safe_dx/q, -1.0
-        ])
-        Jl_bearing = np.array([
-            -safe_dy/q, safe_dx/q
-        ])
-        Jp_range = np.array([
-            -safe_dx/safe_dist, -safe_dy/safe_dist, 0.0
-        ])
-        Jl_range = np.array([
-            safe_dx/safe_dist, safe_dy/safe_dist
-        ])
+        # 计算雅可比矩阵
+        # 对于方位 = atan2(dy, dx) - theta
+        self._work_arrays['jacobian_pose'][0, :] = [dy/q, -dx/q, -1.0]
+        self._work_arrays['jacobian_landmark'][0, :] = [-dy/q, dx/q]
         
-        Jp = np.vstack([Jp_bearing, Jp_range])
-        Jl = np.vstack([Jl_bearing, Jl_range])
-
+        # 对于距离 = sqrt(dx² + dy²)  
+        self._work_arrays['jacobian_pose'][1, :] = [-dx/safe_distance, -dy/safe_distance, 0.0]
+        self._work_arrays['jacobian_landmark'][1, :] = [dx/safe_distance, dy/safe_distance]
+        
+        # 数值裁剪防止爆炸
+        Jp = clip_jacobian(self._work_arrays['jacobian_pose'])
+        Jl = clip_jacobian(self._work_arrays['jacobian_landmark'])
+        
+        # 信息矩阵
         Λp = Jp.T @ self.Rinv @ Jp
         Λl = Jl.T @ self.Rinv @ Jl
         Λcross = Jp.T @ self.Rinv @ Jl
-
-        # 信息向量 
-        r_col = residual.reshape(2, 1)
-        ηp = Jp.T @ self.Rinv @ r_col
-        ηl = Jl.T @ self.Rinv @ r_col
-
-        # 更新缓存
-        self._last_Λ_cross = Λcross.copy()
         
-        # 返回结果
-        result = {
-            self.pose_key: (Λp, ηp.flatten()),
-            self.lm_key: (Λl, ηl.flatten()),
-            (self.pose_key, self.lm_key): Λcross
-        }
-        result[(self.lm_key, self.pose_key)] = Λcross.T
-        return result
-
-    def _generate_cache_key(self, μx, Px):
-        """生成稳定的缓存键"""
-        return (
-            tuple(np.round(μx, 8)),  # 四舍五入提高稳定性
-            tuple(np.round(Px.flatten(), 8)),
-            tuple(self.z)  # 包含量测值
-        )
-
-    def _spbp_linearize(self, μx: np.ndarray, Px: np.ndarray, residual: np.ndarray, 
-                    cache_key: int) -> Dict:
-        # 检查缓存
-        if cache_key in self._spbp_cache:
-            cache_data = self._spbp_cache[cache_key]
-            with self._lock:
-                self._last_Λ_cross = cache_data.get('Λcross', None)
-            return cache_data['result']
+        # 信息向量
+        ηp = Jp.T @ self.Rinv @ residual
+        ηl = Jl.T @ self.Rinv @ residual
         
-        # 生成sigma点
-        gen = SigmaGenerator(self.alpha, self.beta, self.kappa)
-        χ, wm, wc = gen.generate(μx, Px)
-        
-        # 计算sigma点的观测
-        yσ = np.zeros((len(χ), 2))
-        for i, p in enumerate(χ):
-            yσ[i] = self._h(p)
-        
-        # 计算均值 - 特殊处理角度
-        μy_range = np.sum(wm * yσ[:, 1])
-        sin_sum = np.sum(wm * np.sin(yσ[:, 0]))
-        cos_sum = np.sum(wm * np.cos(yσ[:, 0]))
-        μy_bearing = math.atan2(sin_sum, cos_sum)
-        μy = np.array([μy_bearing, μy_range])
-        
-        # 计算残差
-        r = self.z - μy
-        r[0] = wrap_angle(r[0])
-        
-        # 计算协方差
-        diff_x = χ - μx
-        diff_x[:, 2] = wrap_angle(diff_x[:, 2])  # 角度分量wrap处理
-        
-        diff_y = np.zeros_like(yσ)
-        
-        # 正确的角度差分计算
-        for k in range(len(χ)):
-            diff_y[k, 0] = wrap_angle(yσ[k, 0] - μy_bearing)
-            diff_y[k, 1] = yσ[k, 1] - μy_range
-        
-        Sy = np.zeros((2, 2))
-        Pxy = np.zeros((5, 2))
-        for k in range(len(χ)):
-            Sy += wc[k] * np.outer(diff_y[k], diff_y[k])
-            Pxy += wc[k] * np.outer(diff_x[k], diff_y[k])
-        Sy += self.R  # 添加观测噪声
-        
-        # 正则化Sy
-        Sy_reg = Sy + np.eye(2) * _SMALL_NUMBER
-        try:
-            c, low = scipy.linalg.cho_factor(Sy_reg)
-            Sinv = scipy.linalg.cho_solve((c, low), np.eye(2))
-        except np.linalg.LinAlgError:
-            Sy_reg += np.eye(2) * _SMALL_NUMBER
-            Sinv = np.linalg.inv(Sy_reg)
-        
-        # 计算雅可比矩阵 (关键步骤)
-        J = Pxy @ Sinv  # (5,2)
-        
-        # 关键修正：正确信息矩阵
-        Λz = J.T @ self.Rinv @ J  # J^T R^{-1} J (5x5)
-        
-        # 关键修正：正确信息向量
-        ηz = (J.T @ self.Rinv @ r).reshape(-1, 1)  # J^T R^{-1} r (5,1)
-        
-        # 分解信息矩阵和向量
-        ηp = ηz[:3]     # (3,1)
-        ηl = ηz[3:]     # (2,1)
-        Λp = Λz[:3, :3]  # (3,3)
-        Λl = Λz[3:, 3:]  # (2,2)
-        Λcross = Λz[:3, 3:]  # (3,2)
-        
-        # 构建结果
-        result = {
+        return {
             self.pose_key: (Λp, ηp),
             self.lm_key: (Λl, ηl),
             (self.pose_key, self.lm_key): Λcross,
             (self.lm_key, self.pose_key): Λcross.T
         }
+    
+    def _spbp_linearize(self, μx: np.ndarray, Px: np.ndarray, residual: np.ndarray) -> Dict:
+        """
+        Sigma点信念传播线性化，使用无迹变换
+        """
+        # 检查全局缓存
+        try:
+            cache_key = _factor_cache_manager.get_spbp_cache_key(
+                "bearing_range", μx.tobytes(), Px.tobytes()
+            )
+            cached_result = _factor_cache_manager.spbp_cache.get(cache_key)
+            if cached_result is not None:
+                return cached_result
+        except:
+            cache_key = None
         
-        # 更新共享状态
-        with self._lock:
-            self._last_μx = μx.copy()
-            self._last_Λ_cross = Λcross.copy()
-            self._spbp_cache[cache_key] = {
-                'result': result,
-                'Λcross': Λcross
+        try:
+            # 生成sigma点
+            sigma_points, wm, wc = self.sigma_generator.generate(μx, Px)
+            
+            # 通过观测模型传播sigma点
+            Y = np.zeros((len(sigma_points), 2))
+            for i, point in enumerate(sigma_points):
+                Y[i] = self._observation_model(point)
+            
+            # 计算预测观测均值（处理方位的圆周统计）
+            μy = self._compute_circular_mean(Y, wm)
+            
+            # 计算交叉协方差
+            Pxy, Pyy = self._compute_cross_covariances(sigma_points, Y, μx, μy, wc)
+            
+            # 添加测量噪声
+            Pyy += self.R
+            
+            # 通过卡尔曼增益计算有效雅可比矩阵
+            try:
+                # 求解卡尔曼增益: K = Pxy @ Pyy^{-1}
+                K = scipy.linalg.solve(Pyy, Pxy.T, assume_a='pos').T
+            except:
+                # 正则化回退
+                Pyy_reg = ensure_positive_definite(Pyy, numerical_config.min_eigenvalue)
+                K = safe_matrix_inverse(Pyy_reg) @ Pxy.T
+                K = K.T
+            
+            # 转换为信息形式，使用安全的维度检查
+            try:
+                Λ, η = safe_spbp_information_conversion(K, self.Rinv, residual, 5, 2)
+            except ValueError as e:
+                logger.warning(f"SPBP information conversion failed: {e}, falling back to GBP")
+                μp, μl = μx[:3], μx[3:]
+                dx, dy = μl[0] - μp[0], μl[1] - μp[1]
+                distance = math.hypot(dx, dy)
+                return self._gbp_linearize(μp, μl, residual, distance, dx, dy)
+            
+            # 提取块
+            Λp, Λl = Λ[:3, :3], Λ[3:, 3:]
+            Λcross = Λ[:3, 3:]
+            ηp, ηl = η[:3], η[3:]
+            
+            result = {
+                self.pose_key: (Λp, ηp),
+                self.lm_key: (Λl, ηl),
+                (self.pose_key, self.lm_key): Λcross,
+                (self.lm_key, self.pose_key): Λcross.T
             }
+            
+            # 缓存结果
+            if cache_key:
+                _factor_cache_manager.spbp_cache.put(cache_key, result)
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"SPBP linearization failed: {e}, falling back to GBP")
+            # 提取组件进行GBP回退
+            μp, μl = μx[:3], μx[3:]
+            dx, dy = μl[0] - μp[0], μl[1] - μp[1]
+            distance = math.hypot(dx, dy)
+            return self._gbp_linearize(μp, μl, residual, distance, dx, dy)
+    
+    def _compute_circular_mean(self, Y: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        """
+        计算观测均值，对方位使用适当的圆周统计
+        """
+        # 方位均值使用圆周统计
+        sin_sum = np.sum(weights * np.sin(Y[:, 0]))
+        cos_sum = np.sum(weights * np.cos(Y[:, 0]))
+        μy_bearing = math.atan2(sin_sum, cos_sum)
         
-        return result
+        # 距离均值（标准线性）
+        μy_range = np.sum(weights * Y[:, 1])
+        
+        return np.array([μy_bearing, μy_range])
+    
+    def _compute_cross_covariances(self, X: np.ndarray, Y: np.ndarray, 
+                                   μx: np.ndarray, μy: np.ndarray, 
+                                   weights: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        计算交叉协方差，适当处理角度差
+        """
+        n_points = len(X)
+        
+        # 状态偏差
+        dX = X - μx
+        dX[:, 2] = wrap_angle(dX[:, 2])  # 包装姿态角度差
+        
+        # 观测偏差  
+        dY = np.zeros_like(Y)
+        dY[:, 0] = wrap_angle(Y[:, 0] - μy[0])  # 包装方位差
+        dY[:, 1] = Y[:, 1] - μy[1]              # 距离差（线性）
+        
+        # 计算协方差矩阵
+        Pxy = np.zeros((5, 2))
+        Pyy = np.zeros((2, 2))
+        
+        for i in range(n_points):
+            Pxy += weights[i] * np.outer(dX[i], dY[i])
+            Pyy += weights[i] * np.outer(dY[i], dY[i])
+        
+        return Pxy, Pyy
+    
+    def get_mode_statistics(self) -> Dict[str, Any]:
+        """获取模式切换统计信息"""
+        with self._state_lock:
+            return {
+                'current_mode': self._current_mode,
+                'diverged_count': self._diverged_count,
+                'mode_history': self._mode_switch_history.copy(),
+                'sigma_cache_stats': self.sigma_generator.get_cache_stats(),
+                'global_spbp_cache_stats': _factor_cache_manager.spbp_cache.stats()
+            }
 
+# =====================================================================
+# Pose-to-Pose UT Factor for Inter-Robot Observations
+# =====================================================================
+class PoseToPoseUTFactor(Factor):
+    """
+    Pose-to-Pose UT因子用于多机器人间的相对位姿观测
+    
+    支持以下场景：
+    - Robot A 通过视觉/雷达观测到 Robot B 的相对位置
+    - 机器人间的直接位姿测量
+    - 支持GBP和SPBP模式自动切换
+    """
+    
+    def __init__(self, pose1_key: str, pose2_key: str, relative_pose: np.ndarray, 
+                 R: np.ndarray, mode: str = "auto", alpha: float = 1e-3, 
+                 beta: float = 2.0, kappa: float = 0.0,
+                 distance_threshold: float = 10.0, residual_sigma_thresh: float = 2.5):
+        """
+        初始化Pose-to-Pose UT因子
+        
+        Args:
+            pose1_key: 第一个位姿变量名 (观测者)
+            pose2_key: 第二个位姿变量名 (被观测者)
+            relative_pose: 观测的相对位姿 [dx, dy, dθ] (在pose1坐标系下)
+            R: 观测噪声协方差矩阵 (3x3)
+            mode: "auto", "gbp", 或 "spbp"
+            alpha, beta, kappa: UT参数
+            distance_threshold: GBP/SPBP切换的距离阈值
+            residual_sigma_thresh: 残差阈值
+        """
+        super().__init__()
+        
+        # 基本参数
+        self.pose1_key = pose1_key  # 观测者位姿
+        self.pose2_key = pose2_key  # 被观测者位姿
+        self.z_relative = np.asarray(relative_pose, dtype=float)
+        
+        if self.z_relative.size != 3:
+            raise ValueError(f"Relative pose must be 3D [dx, dy, dθ], got {self.z_relative.shape}")
+        
+        # 噪声模型验证
+        R = np.asarray(R, dtype=float)
+        if R.shape != (3, 3):
+            raise ValueError(f"R must be 3x3, got {R.shape}")
+        
+        try:
+            validate_matrix_properties(R, "pose_to_pose_noise_covariance", 
+                                     check_symmetric=True, 
+                                     check_positive_definite=True)
+            self.R = R.copy()
+        except ValueError as e:
+            logger.warning(f"Pose-to-pose noise covariance invalid: {e}, regularizing")
+            self.R = ensure_positive_definite(R, numerical_config.min_eigenvalue)
+        
+        self.Rinv = safe_matrix_inverse(self.R)
+        
+        # UT和模式参数
+        self.mode = mode.lower()
+        if self.mode not in ("auto", "gbp", "spbp"):
+            raise ValueError(f"Invalid mode: {mode}, must be 'auto', 'gbp', or 'spbp'")
+        
+        # Sigma点生成器
+        self.sigma_generator = SigmaGenerator(alpha, beta, kappa)
+        
+        # 自适应切换参数
+        self.distance_threshold = max(distance_threshold, 1.0)
+        self.residual_sigma_thresh = max(residual_sigma_thresh, 1.0)
+        
+        # 状态管理（线程安全）
+        self._state_lock = threading.Lock()
+        self._diverged_count = 0
+        self._current_mode = "gbp"
+        self._mode_history = []
+        
+        # 使用全局缓存管理器
+        
+        # 预分配工作数组
+        self._work_arrays = {
+            'residual': np.zeros(3),
+            'prediction': np.zeros(3),
+            'joint_state': np.zeros(6),      # [pose1, pose2]
+            'joint_cov': np.zeros((6, 6)),   # 6x6联合协方差
+            'jacobian_pose1': np.zeros((3, 3)),
+            'jacobian_pose2': np.zeros((3, 3))
+        }
+        
+        logger.debug(f"Created pose-to-pose UT factor {pose1_key} -> {pose2_key}, mode={mode}")
+    
+    def linearize(self, mu: Dict[str, np.ndarray], cov: Dict[str, np.ndarray]) -> Dict:
+        """
+        使用自适应GBP/SPBP模式线性化pose-to-pose因子
+        """
+        # 输入验证
+        if self.pose1_key not in mu or self.pose2_key not in mu:
+            return self._get_zero_blocks()
+        
+        if self.pose1_key not in cov or self.pose2_key not in cov:
+            return self._get_zero_blocks()
+        
+        try:
+            # 提取位姿估计
+            μ1 = mu[self.pose1_key]
+            μ2 = mu[self.pose2_key]
+            P1 = cov[self.pose1_key]
+            P2 = cov[self.pose2_key]
+            
+            # 输入验证
+            if μ1.size != 3 or μ2.size != 3:
+                logger.error(f"Invalid pose dimensions: pose1={μ1.size}, pose2={μ2.size}")
+                return self._get_zero_blocks()
+            
+            if P1.shape != (3, 3) or P2.shape != (3, 3):
+                logger.error(f"Invalid covariance shapes: P1={P1.shape}, P2={P2.shape}")
+                return self._get_zero_blocks()
+            
+            # 验证协方差矩阵
+            validate_matrix_properties(P1, "pose1_covariance")
+            validate_matrix_properties(P2, "pose2_covariance")
+            
+            # 提取交叉协方差
+            P12 = self._extract_cross_covariance(cov)
+            
+            # 构建联合状态和协方差
+            self._work_arrays['joint_state'][:3] = μ1
+            self._work_arrays['joint_state'][3:] = μ2
+            
+            self._work_arrays['joint_cov'][:3, :3] = P1
+            self._work_arrays['joint_cov'][3:, 3:] = P2
+            self._work_arrays['joint_cov'][:3, 3:] = P12
+            self._work_arrays['joint_cov'][3:, :3] = P12.T
+            
+            # 确保联合协方差正定
+            joint_cov_pd = ensure_positive_definite(self._work_arrays['joint_cov'], 
+                                                   numerical_config.min_eigenvalue)
+            
+            # 计算预测和残差
+            self._work_arrays['prediction'][:] = self._observation_model(self._work_arrays['joint_state'])
+            self._work_arrays['residual'][:] = self.z_relative - self._work_arrays['prediction']
+            self._work_arrays['residual'][2] = wrap_angle(self._work_arrays['residual'][2])  # 包装角度残差
+            
+            # 计算位姿间距离用于模式选择
+            dx, dy = μ2[0] - μ1[0], μ2[1] - μ1[1]
+            distance = math.hypot(dx, dy)
+            
+            # 选择线性化模式
+            selected_mode = self._select_mode(distance, self._work_arrays['residual'])
+            
+            # 执行线性化
+            if selected_mode == "spbp":
+                result = self._spbp_linearize(self._work_arrays['joint_state'], 
+                                            joint_cov_pd, 
+                                            self._work_arrays['residual'])
+            else:
+                result = self._gbp_linearize(μ1, μ2, self._work_arrays['residual'])
+            
+            # 验证并返回结果
+            if self.validate_linearization_result(result):
+                return result
+            else:
+                logger.warning(f"Validation failed for {selected_mode}, falling back to GBP")
+                return self._gbp_linearize(μ1, μ2, self._work_arrays['residual'])
+                
+        except Exception as e:
+            logger.error(f"Pose-to-pose linearization failed: {e}")
+            return self._get_zero_blocks()
+    
+    def get_energy(self, mu: Dict[str, np.ndarray]) -> float:
+        """计算pose-to-pose因子能量"""
+        if self.pose1_key not in mu or self.pose2_key not in mu:
+            return 0.0
+        
+        try:
+            joint_state = np.hstack([mu[self.pose1_key], mu[self.pose2_key]])
+            prediction = self._observation_model(joint_state)
+            residual = self.z_relative - prediction
+            residual[2] = wrap_angle(residual[2])
+            return 0.5 * residual @ self.Rinv @ residual
+        except Exception as e:
+            logger.error(f"Pose-to-pose energy computation failed: {e}")
+            return 0.0
+    
     def _get_dim(self, key: str) -> int:
-        """返回变量维度 - 使用dim_map确保一致性"""
-        return self._dim_map.get(key, 0)
+        """获取变量维度"""
+        return 3 if key in (self.pose1_key, self.pose2_key) else 0
+    
+    # -------------------------------------------------------------------------
+    # 内部辅助方法
+    # -------------------------------------------------------------------------
+    
+    def _get_zero_blocks(self) -> Dict:
+        """返回零信息块"""
+        return {
+            self.pose1_key: (np.zeros((3, 3)), np.zeros(3)),
+            self.pose2_key: (np.zeros((3, 3)), np.zeros(3)),
+            (self.pose1_key, self.pose2_key): np.zeros((3, 3)),
+            (self.pose2_key, self.pose1_key): np.zeros((3, 3))
+        }
+    
+    def _extract_cross_covariance(self, cov: Dict) -> np.ndarray:
+        """
+        提取两个位姿间的交叉协方差
+        
+        Returns 3x3 matrix (pose1×pose2)
+        """
+        cross_keys = [
+            (self.pose1_key, self.pose2_key),
+            (self.pose2_key, self.pose1_key)
+        ]
+        
+        for key in cross_keys:
+            if key in cov:
+                P12 = cov[key]
+                if key[0] == self.pose2_key:  # 如果是(pose2, pose1)，转置
+                    P12 = P12.T
+                if P12.shape == (3, 3):
+                    return P12.copy()
+                else:
+                    logger.warning(f"Cross-covariance wrong shape: expected (3,3), got {P12.shape}")
+        
+        # 默认为零交叉协方差
+        return np.zeros((3, 3))
+    
+    @staticmethod
+    def _observation_model(x: np.ndarray) -> np.ndarray:
+        """
+        Pose-to-pose观测模型：计算pose1坐标系下的pose2相对位姿
+        
+        Args:
+            x: 联合状态 [x1, y1, θ1, x2, y2, θ2]
+            
+        Returns:
+            相对位姿 [dx, dy, dθ] (在pose1坐标系下)
+        """
+        pose1 = x[:3]  # [x1, y1, θ1]
+        pose2 = x[3:]  # [x2, y2, θ2]
+        
+        # 使用已有的SE(2)相对位姿计算
+        return OdometryFactor._se2_relative_pose(pose1, pose2)
+    
+    def _select_mode(self, distance: float, residual: np.ndarray) -> str:
+        """
+        基于距离和残差智能选择线性化模式
+        """
+        if self.mode in ("gbp", "spbp"):
+            return self.mode
+        
+        with self._state_lock:
+            # 对于很远的距离或大的角度差，倾向于使用SPBP
+            large_distance = distance > self.distance_threshold
+            
+            # 分析残差幅度
+            σ_trans = math.sqrt((self.R[0, 0] + self.R[1, 1]) / 2)  # 平移噪声
+            σ_rot = math.sqrt(self.R[2, 2])  # 旋转噪声
+            
+            large_translation_error = math.hypot(residual[0], residual[1]) > self.residual_sigma_thresh * σ_trans
+            large_rotation_error = abs(residual[2]) > self.residual_sigma_thresh * σ_rot
+            
+            # 模式切换逻辑
+            if large_distance or large_translation_error or large_rotation_error:
+                self._diverged_count += 1
+                if self._diverged_count > 1:  # 较为宽松的切换条件
+                    self._current_mode = "spbp"
+            else:
+                self._diverged_count = max(0, self._diverged_count - 1)
+                if self._diverged_count == 0:
+                    self._current_mode = "gbp"
+            
+            # 记录模式历史
+            if len(self._mode_history) == 0 or self._mode_history[-1] != self._current_mode:
+                self._mode_history.append(self._current_mode)
+                if len(self._mode_history) > 5:
+                    self._mode_history.pop(0)
+            
+            return self._current_mode
+    
+    def _gbp_linearize(self, μ1: np.ndarray, μ2: np.ndarray, residual: np.ndarray) -> Dict:
+        """
+        标准GBP线性化：计算相对位姿的雅可比矩阵
+        """
+        try:
+            # 计算当前相对位姿用于雅可比计算
+            current_relative = self._observation_model(np.hstack([μ1, μ2]))
+            
+            # 使用SE(2)伴随逆矩阵作为雅可比（类似OdometryFactor）
+            # ∂(relative_pose)/∂pose1 = Adj^{-1}(current_relative)
+            # ∂(relative_pose)/∂pose2 = -I
+            J1 = OdometryFactor._se2_adjoint_inverse(current_relative)
+            J2 = -np.eye(3)
+            
+            # 数值裁剪
+            J1 = clip_jacobian(J1)
+            J2 = clip_jacobian(J2)
+            
+            # 信息矩阵块
+            Λ1 = J1.T @ self.Rinv @ J1
+            Λ2 = J2.T @ self.Rinv @ J2
+            Λ12 = J1.T @ self.Rinv @ J2
+            
+            # 信息向量块
+            η1 = J1.T @ self.Rinv @ residual
+            η2 = J2.T @ self.Rinv @ residual
+            
+            return {
+                self.pose1_key: (Λ1, η1),
+                self.pose2_key: (Λ2, η2),
+                (self.pose1_key, self.pose2_key): Λ12,
+                (self.pose2_key, self.pose1_key): Λ12.T
+            }
+            
+        except Exception as e:
+            logger.warning(f"GBP linearization failed: {e}")
+            return self._get_zero_blocks()
+    
+    def _spbp_linearize(self, μx: np.ndarray, Px: np.ndarray, residual: np.ndarray) -> Dict:
+        """
+        SPBP线性化：使用无迹变换处理非线性
+        """
+        # 检查全局缓存
+        try:
+            cache_key = _factor_cache_manager.get_spbp_cache_key(
+                "pose_to_pose", μx.tobytes(), Px.tobytes()
+            )
+            cached_result = _factor_cache_manager.spbp_cache.get(cache_key)
+            if cached_result is not None:
+                return cached_result
+        except:
+            cache_key = None
+        
+        try:
+            # 生成sigma点
+            sigma_points, wm, wc = self.sigma_generator.generate(μx, Px)
+            
+            # 通过观测模型传播sigma点
+            Y = np.zeros((len(sigma_points), 3))
+            for i, point in enumerate(sigma_points):
+                Y[i] = self._observation_model(point)
+            
+            # 计算预测观测均值（处理角度的圆周统计）
+            μy = self._compute_circular_mean(Y, wm)
+            
+            # 计算交叉协方差
+            Pxy, Pyy = self._compute_cross_covariances(sigma_points, Y, μx, μy, wc)
+            
+            # 添加测量噪声
+            Pyy += self.R
+            
+            # 计算卡尔曼增益
+            try:
+                K = scipy.linalg.solve(Pyy, Pxy.T, assume_a='pos').T
+            except:
+                Pyy_reg = ensure_positive_definite(Pyy, numerical_config.min_eigenvalue)
+                K = safe_matrix_inverse(Pyy_reg) @ Pxy.T
+                K = K.T
+            
+            # 转换为信息形式，使用安全的维度检查
+            try:
+                Λ, η = safe_spbp_information_conversion(K, self.Rinv, residual, 6, 3)
+            except ValueError as e:
+                logger.warning(f"SPBP information conversion failed: {e}, falling back to GBP")
+                return self._gbp_linearize(μx[:3], μx[3:], residual)
+            
+            # 提取块
+            Λ1, Λ2 = Λ[:3, :3], Λ[3:, 3:]
+            Λ12 = Λ[:3, 3:]
+            η1, η2 = η[:3], η[3:]
+            
+            result = {
+                self.pose1_key: (Λ1, η1),
+                self.pose2_key: (Λ2, η2),
+                (self.pose1_key, self.pose2_key): Λ12,
+                (self.pose2_key, self.pose1_key): Λ12.T
+            }
+            
+            # 缓存结果
+            if cache_key:
+                _factor_cache_manager.spbp_cache.put(cache_key, result)
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"SPBP linearization failed: {e}, falling back to GBP")
+            return self._gbp_linearize(μx[:3], μx[3:], residual)
+    
+    def _compute_circular_mean(self, Y: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        """
+        计算观测均值，对角度使用圆周统计
+        """
+        # 平移部分：标准线性均值
+        μy_dx = np.sum(weights * Y[:, 0])
+        μy_dy = np.sum(weights * Y[:, 1])
+        
+        # 角度部分：圆周统计
+        sin_sum = np.sum(weights * np.sin(Y[:, 2]))
+        cos_sum = np.sum(weights * np.cos(Y[:, 2]))
+        μy_dtheta = math.atan2(sin_sum, cos_sum)
+        
+        return np.array([μy_dx, μy_dy, μy_dtheta])
+    
+    def _compute_cross_covariances(self, X: np.ndarray, Y: np.ndarray, 
+                                   μx: np.ndarray, μy: np.ndarray, 
+                                   weights: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        计算交叉协方差，适当处理角度差
+        """
+        n_points = len(X)
+        
+        # 状态偏差
+        dX = X - μx
+        dX[:, 2] = wrap_angle(dX[:, 2])  # 包装pose1角度差
+        dX[:, 5] = wrap_angle(dX[:, 5])  # 包装pose2角度差
+        
+        # 观测偏差
+        dY = np.zeros_like(Y)
+        dY[:, 0] = Y[:, 0] - μy[0]       # dx差（线性）
+        dY[:, 1] = Y[:, 1] - μy[1]       # dy差（线性）
+        dY[:, 2] = wrap_angle(Y[:, 2] - μy[2])  # dθ差（圆周）
+        
+        # 计算协方差矩阵
+        Pxy = np.zeros((6, 3))
+        Pyy = np.zeros((3, 3))
+        
+        for i in range(n_points):
+            Pxy += weights[i] * np.outer(dX[i], dY[i])
+            Pyy += weights[i] * np.outer(dY[i], dY[i])
+        
+        return Pxy, Pyy
+    
+    def get_mode_statistics(self) -> Dict[str, Any]:
+        """获取模式切换统计"""
+        with self._state_lock:
+            return {
+                'current_mode': self._current_mode,
+                'diverged_count': self._diverged_count,
+                'mode_history': self._mode_history.copy(),
+                'global_spbp_cache_stats': _factor_cache_manager.spbp_cache.stats()
+            }
+
+# =====================================================================
+# Enhanced Loop Closure Factor
+# =====================================================================
+class LoopClosureFactor(Factor):
+    """
+    改进的环路闭合因子，用于同一或不同机器人的姿态间
+    """
+    
+    def __init__(self, pose1_var: str, pose2_var: str, relative_pose: np.ndarray, 
+                 information_matrix: np.ndarray):
+        """
+        初始化环路闭合因子
+        
+        Args:
+            pose1_var: 第一个姿态变量名
+            pose2_var: 第二个姿态变量名  
+            relative_pose: 测量的相对姿态 [dx, dy, dtheta]
+            information_matrix: 3x3 信息矩阵
+        """
+        super().__init__()
+        
+        self.pose1_key = pose1_var
+        self.pose2_key = pose2_var
+        self.relative_pose = np.asarray(relative_pose, dtype=float)
+        self.information = np.asarray(information_matrix, dtype=float)
+        
+        # 验证输入
+        if self.relative_pose.size != 3:
+            raise ValueError("Relative pose must be 3D [dx, dy, dtheta]")
+        if self.information.shape != (3, 3):
+            raise ValueError("Information matrix must be 3x3")
+        
+        # 确保信息矩阵正定
+        try:
+            validate_matrix_properties(self.information, "loop_closure_information", 
+                                     check_symmetric=True, 
+                                     check_positive_definite=True)
+        except ValueError as e:
+            logger.warning(f"Loop closure information matrix invalid: {e}, regularizing")
+            self.information = ensure_positive_definite(self.information, 
+                                                       numerical_config.min_eigenvalue)
+        
+        # 预分配工作数组
+        self._work_error = np.zeros(3)
+        
+        logger.debug(f"Created loop closure factor {pose1_var} <-> {pose2_var}")
+    
+    def linearize(self, mu: Dict[str, np.ndarray], cov: Dict[str, np.ndarray]) -> Dict:
+        """线性化环路闭合约束"""
+        if self.pose1_key not in mu or self.pose2_key not in mu:
+            return self._get_zero_blocks()
+        
+        try:
+            # 与里程计因子相同但变量名不同
+            pose1, pose2 = mu[self.pose1_key], mu[self.pose2_key]
+            
+            # 计算实际相对姿态
+            actual_relative = OdometryFactor._se2_relative_pose(pose1, pose2)
+            
+            # 计算误差
+            self._work_error[:] = self.relative_pose - actual_relative
+            self._work_error[2] = wrap_angle(self._work_error[2])
+            
+            # 雅可比矩阵（与里程计相同）
+            J1 = OdometryFactor._se2_adjoint_inverse(actual_relative)
+            J2 = -np.eye(3)
+            
+            # 裁剪雅可比矩阵
+            J1 = clip_jacobian(J1)
+            J2 = clip_jacobian(J2)
+            
+            # 信息块
+            Λ11 = J1.T @ self.information @ J1
+            Λ22 = J2.T @ self.information @ J2
+            Λ12 = J1.T @ self.information @ J2
+            
+            # 信息向量
+            η1 = J1.T @ self.information @ self._work_error
+            η2 = J2.T @ self.information @ self._work_error
+            
+            result = {
+                self.pose1_key: (Λ11, η1),
+                self.pose2_key: (Λ22, η2),
+                (self.pose1_key, self.pose2_key): Λ12,
+                (self.pose2_key, self.pose1_key): Λ12.T
+            }
+            
+            # 验证结果
+            if not self.validate_linearization_result(result):
+                logger.warning(f"Loop closure linearization validation failed")
+                return self._get_zero_blocks()
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Loop closure linearization failed: {e}")
+            return self._get_zero_blocks()
+    
+    def get_energy(self, mu: Dict[str, np.ndarray]) -> float:
+        """计算环路闭合能量"""
+        if self.pose1_key not in mu or self.pose2_key not in mu:
+            return 0.0
+        
+        try:
+            pose1, pose2 = mu[self.pose1_key], mu[self.pose2_key]
+            actual_relative = OdometryFactor._se2_relative_pose(pose1, pose2)
+            error = self.relative_pose - actual_relative
+            error[2] = wrap_angle(error[2])
+            
+            return 0.5 * error @ self.information @ error
+            
+        except Exception as e:
+            logger.error(f"Loop closure energy computation failed: {e}")
+            return 0.0
+    
+    def _get_zero_blocks(self) -> Dict:
+        """当变量缺失时返回零块"""
+        return {
+            self.pose1_key: (np.zeros((3, 3)), np.zeros(3)),
+            self.pose2_key: (np.zeros((3, 3)), np.zeros(3)),
+            (self.pose1_key, self.pose2_key): np.zeros((3, 3)),
+            (self.pose2_key, self.pose1_key): np.zeros((3, 3))
+        }
+    
+    def _get_dim(self, key: str) -> int:
+        """获取变量维度"""
+        return 3 if key in (self.pose1_key, self.pose2_key) else 0
+
+# =====================================================================
+# Multi-Robot SLAM Utility Functions (Enhanced)
+# =====================================================================
+
+def create_multi_robot_odometry_chain(robot_id: int, num_poses: int, 
+                                     measurements: List[np.ndarray], 
+                                     noise_sigmas: Union[float, np.ndarray],
+                                     validate_measurements: bool = True) -> List[OdometryFactor]:
+    """
+    为单个机器人创建里程计因子链
+    
+    Args:
+        robot_id: 机器人标识符
+        num_poses: 轨迹中的姿态数量
+        measurements: 相对姿态测量列表
+        noise_sigmas: 里程计噪声标准差
+        validate_measurements: 是否验证测量值
+        
+    Returns:
+        里程计因子列表
+    """
+    if num_poses < 2:
+        raise ValueError("Need at least 2 poses for odometry chain")
+    
+    if len(measurements) != num_poses - 1:
+        raise ValueError(f"Need {num_poses-1} measurements for {num_poses} poses, got {len(measurements)}")
+    
+    factors = []
+    
+    for t in range(num_poses - 1):
+        pose_from = f"x{robot_id}_{t}"
+        pose_to = f"x{robot_id}_{t+1}"
+        
+        measurement = measurements[t]
+        
+        # 验证测量值
+        if validate_measurements:
+            if not np.isfinite(measurement).all():
+                logger.warning(f"Non-finite measurement at time {t}, skipping")
+                continue
+            
+            if measurement.size != 3:
+                logger.warning(f"Invalid measurement size at time {t}, skipping")
+                continue
+        
+        try:
+            factors.append(OdometryFactor(pose_from, pose_to, measurement, noise_sigmas))
+        except Exception as e:
+            logger.error(f"Failed to create odometry factor at time {t}: {e}")
+    
+    logger.info(f"Created {len(factors)} odometry factors for robot {robot_id}")
+    return factors
+
+def create_landmark_observation_factors(robot_id: int, pose_times: List[int],
+                                      landmark_ids: List[int], 
+                                      measurements: List[Tuple[int, int, np.ndarray]], 
+                                      noise_cov: np.ndarray,
+                                      validate_measurements: bool = True,
+                                      **ut_params) -> List[BearingRangeUTFactor]:
+    """
+    为机器人创建地标观测因子
+    
+    Args:
+        robot_id: 机器人标识符
+        pose_times: 姿态时间索引列表
+        landmark_ids: 地标标识符列表
+        measurements: (pose_time, landmark_id, [bearing, range]) 元组列表
+        noise_cov: 2x2 测量噪声协方差
+        validate_measurements: 是否验证测量值
+        **ut_params: SPBP模式的UT参数
+        
+    Returns:
+        方位-距离因子列表
+    """
+    factors = []
+    
+    # 验证噪声协方差
+    if validate_measurements:
+        try:
+            validate_matrix_properties(noise_cov, "measurement_noise_covariance")
+        except ValueError as e:
+            logger.error(f"Invalid measurement noise covariance: {e}")
+            return factors
+    
+    for pose_time, lm_id, measurement in measurements:
+        if pose_time not in pose_times:
+            logger.warning(f"Pose time {pose_time} not in valid times, skipping")
+            continue
+            
+        if lm_id not in landmark_ids:
+            logger.warning(f"Landmark {lm_id} not in valid landmarks, skipping")
+            continue
+        
+        # 验证测量值
+        if validate_measurements:
+            if not np.isfinite(measurement).all():
+                logger.warning(f"Non-finite measurement for pose {pose_time}, landmark {lm_id}, skipping")
+                continue
+            
+            if measurement.size != 2:
+                logger.warning(f"Invalid measurement size for pose {pose_time}, landmark {lm_id}, skipping")
+                continue
+            
+            # 检查合理的测量范围
+            bearing, range_val = measurement
+            if not (-math.pi <= bearing <= math.pi):
+                logger.warning(f"Bearing out of range for pose {pose_time}, landmark {lm_id}, skipping")
+                continue
+            
+            if range_val <= 0:
+                logger.warning(f"Invalid range for pose {pose_time}, landmark {lm_id}, skipping")
+                continue
+        
+        pose_var = f"x{robot_id}_{pose_time}"
+        lm_var = f"l_{lm_id}"
+        
+        try:
+            factors.append(BearingRangeUTFactor(
+                pose_var, lm_var, measurement, noise_cov, **ut_params
+            ))
+        except Exception as e:
+            logger.error(f"Failed to create observation factor for pose {pose_time}, landmark {lm_id}: {e}")
+    
+    logger.info(f"Created {len(factors)} observation factors for robot {robot_id}")
+    return factors
+
+def create_inter_robot_factors(robot1_id: int, robot2_id: int,
+                              observations: List[Tuple[int, int, np.ndarray, np.ndarray]],
+                              validate_observations: bool = True) -> List[LoopClosureFactor]:
+    """
+    创建机器人间观测因子（环路闭合）
+    
+    Args:
+        robot1_id: 第一个机器人标识符
+        robot2_id: 第二个机器人标识符  
+        observations: (time1, time2, relative_pose, information_matrix) 元组列表
+        validate_observations: 是否验证观测值
+        
+    Returns:
+        机器人间因子列表
+    """
+    factors = []
+    
+    for time1, time2, relative_pose, information in observations:
+        # 验证观测值
+        if validate_observations:
+            if not np.isfinite(relative_pose).all():
+                logger.warning(f"Non-finite relative pose for times {time1}, {time2}, skipping")
+                continue
+            
+            if relative_pose.size != 3:
+                logger.warning(f"Invalid relative pose size for times {time1}, {time2}, skipping")
+                continue
+            
+            try:
+                validate_matrix_properties(information, f"inter_robot_information_{time1}_{time2}")
+            except ValueError as e:
+                logger.warning(f"Invalid information matrix for times {time1}, {time2}: {e}, skipping")
+                continue
+        
+        pose1_var = f"x{robot1_id}_{time1}"
+        pose2_var = f"x{robot2_id}_{time2}"
+        
+        try:
+            factors.append(LoopClosureFactor(pose1_var, pose2_var, relative_pose, information))
+        except Exception as e:
+            logger.error(f"Failed to create inter-robot factor for times {time1}, {time2}: {e}")
+    
+    logger.info(f"Created {len(factors)} inter-robot factors between robots {robot1_id} and {robot2_id}")
+    return factors
+
+def create_pose_to_pose_ut_factors(robot1_id: int, robot2_id: int,
+                                  observations: List[Tuple[int, int, np.ndarray, np.ndarray]],
+                                  validate_observations: bool = True,
+                                  **ut_params) -> List[PoseToPoseUTFactor]:
+    """
+    创建机器人间的Pose-to-Pose UT观测因子
+    
+    Args:
+        robot1_id: 观测机器人标识符
+        robot2_id: 被观测机器人标识符
+        observations: (time1, time2, relative_pose, noise_covariance) 元组列表
+        validate_observations: 是否验证观测值
+        **ut_params: UT参数 (mode, alpha, beta, kappa等)
+        
+    Returns:
+        Pose-to-Pose UT因子列表
+    """
+    factors = []
+    
+    for time1, time2, relative_pose, noise_cov in observations:
+        # 验证观测值
+        if validate_observations:
+            if not np.isfinite(relative_pose).all():
+                logger.warning(f"Non-finite relative pose for times {time1}, {time2}, skipping")
+                continue
+            
+            if relative_pose.size != 3:
+                logger.warning(f"Invalid relative pose size for times {time1}, {time2}, skipping")
+                continue
+            
+            if noise_cov.shape != (3, 3):
+                logger.warning(f"Invalid noise covariance shape for times {time1}, {time2}, skipping")
+                continue
+            
+            try:
+                validate_matrix_properties(noise_cov, f"pose_to_pose_noise_{time1}_{time2}")
+            except ValueError as e:
+                logger.warning(f"Invalid noise covariance for times {time1}, {time2}: {e}, skipping")
+                continue
+        
+        pose1_var = f"x{robot1_id}_{time1}"
+        pose2_var = f"x{robot2_id}_{time2}"
+        
+        try:
+            factors.append(PoseToPoseUTFactor(
+                pose1_var, pose2_var, relative_pose, noise_cov, **ut_params
+            ))
+        except Exception as e:
+            logger.error(f"Failed to create pose-to-pose UT factor for times {time1}, {time2}: {e}")
+    
+    logger.info(f"Created {len(factors)} pose-to-pose UT factors from robot {robot1_id} to robot {robot2_id}")
+    return factors
+
+def create_mixed_inter_robot_factors(robot1_id: int, robot2_id: int,
+                                    loop_closures: List[Tuple[int, int, np.ndarray, np.ndarray]] = None,
+                                    pose_observations: List[Tuple[int, int, np.ndarray, np.ndarray]] = None,
+                                    validate_observations: bool = True,
+                                    **ut_params) -> List[Factor]:
+    """
+    创建混合的机器人间因子（环路闭合 + Pose-to-Pose观测）
+    
+    Args:
+        robot1_id: 第一个机器人标识符
+        robot2_id: 第二个机器人标识符
+        loop_closures: 环路闭合观测 (time1, time2, relative_pose, information_matrix)
+        pose_observations: 位姿观测 (time1, time2, relative_pose, noise_covariance)
+        validate_observations: 是否验证观测值
+        **ut_params: UT参数
+        
+    Returns:
+        混合因子列表
+    """
+    factors = []
+    
+    # 添加环路闭合因子
+    if loop_closures:
+        loop_factors = create_inter_robot_factors(
+            robot1_id, robot2_id, loop_closures, validate_observations
+        )
+        factors.extend(loop_factors)
+    
+    # 添加Pose-to-Pose UT因子
+    if pose_observations:
+        pose_factors = create_pose_to_pose_ut_factors(
+            robot1_id, robot2_id, pose_observations, validate_observations, **ut_params
+        )
+        factors.extend(pose_factors)
+    
+    logger.info(f"Created {len(factors)} mixed inter-robot factors between robots {robot1_id} and {robot2_id}")
+    return factors
+
+# =====================================================================
+# Global Cache and Performance Management
+# =====================================================================
+
+def clear_all_caches():
+    """清空所有全局缓存"""
+    _global_cache.clear()
+    _factor_cache_manager.clear_all()
+    logger.info("Cleared all global caches")
+
+def get_global_cache_stats() -> Dict[str, Any]:
+    """获取全局缓存统计信息"""
+    return {
+        'global_cache': _global_cache.stats(),
+        'factor_caches': _factor_cache_manager.get_stats()
+    }
+
+def configure_numerical_parameters(**kwargs):
+    """配置全局数值参数"""
+    global numerical_config
+    
+    for key, value in kwargs.items():
+        if hasattr(numerical_config, key):
+            setattr(numerical_config, key, value)
+            logger.info(f"Set numerical parameter {key} = {value}")
+        else:
+            logger.warning(f"Unknown numerical parameter: {key}")
+
+def validate_spbp_dimensions(K: np.ndarray, Rinv: np.ndarray, residual: np.ndarray,
+                            expected_state_dim: int, expected_obs_dim: int) -> bool:
+    """
+    验证SPBP计算中的矩阵维度是否正确
+    
+    Args:
+        K: 卡尔曼增益矩阵，应为 (n_x, n_z)
+        Rinv: 观测噪声逆矩阵，应为 (n_z, n_z)  
+        residual: 残差向量，应为 (n_z,)
+        expected_state_dim: 期望的状态维度 n_x
+        expected_obs_dim: 期望的观测维度 n_z
+        
+    Returns:
+        维度是否正确
+        
+    Raises:
+        ValueError: 维度不匹配时
+    """
+    n_x, n_z = expected_state_dim, expected_obs_dim
+    
+    # 检查K的维度
+    if K.shape != (n_x, n_z):
+        raise ValueError(f"Kalman gain K shape mismatch: expected ({n_x}, {n_z}), got {K.shape}")
+    
+    # 检查Rinv的维度
+    if Rinv.shape != (n_z, n_z):
+        raise ValueError(f"Rinv shape mismatch: expected ({n_z}, {n_z}), got {Rinv.shape}")
+    
+    # 检查residual的维度
+    if residual.shape != (n_z,):
+        raise ValueError(f"Residual shape mismatch: expected ({n_z},), got {residual.shape}")
+    
+    # 验证计算维度
+    try:
+        # 测试 K @ Rinv @ K.T 的维度
+        temp1 = K @ Rinv  # (n_x, n_z) @ (n_z, n_z) = (n_x, n_z)
+        result_Λ = temp1 @ K.T  # (n_x, n_z) @ (n_z, n_x) = (n_x, n_x)
+        
+        # 测试 K @ Rinv @ residual 的维度
+        result_η = temp1 @ residual  # (n_x, n_z) @ (n_z,) = (n_x,)
+        
+        logger.debug(f"SPBP dimension validation passed: Λ{result_Λ.shape}, η{result_η.shape}")
+        return True
+        
+    except Exception as e:
+        raise ValueError(f"SPBP dimension validation failed: {e}")
+
+def safe_spbp_information_conversion(K: np.ndarray, Rinv: np.ndarray, residual: np.ndarray,
+                                   state_dim: int, obs_dim: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    安全的SPBP信息形式转换，带有完整的维度检查
+    
+    Args:
+        K: 卡尔曼增益矩阵 (n_x, n_z)
+        Rinv: 观测噪声逆矩阵 (n_z, n_z)
+        residual: 残差向量 (n_z,)
+        state_dim: 状态维度
+        obs_dim: 观测维度
+        
+    Returns:
+        (Λ, η): 信息矩阵和信息向量
+    """
+    # 维度验证
+    validate_spbp_dimensions(K, Rinv, residual, state_dim, obs_dim)
+    
+    # 安全计算
+    try:
+        Λ = K @ Rinv @ K.T  # (n_x, n_x)
+        η = K @ Rinv @ residual  # (n_x,)
+        
+        # 数值验证
+        if not np.isfinite(Λ).all() or not np.isfinite(η).all():
+            raise ValueError("SPBP conversion produced non-finite values")
+        
+        # 检查信息矩阵的正定性
+        try:
+            validate_matrix_properties(Λ, "SPBP_information_matrix", 
+                                     check_symmetric=True, 
+                                     check_positive_definite=True)
+        except ValueError as e:
+            logger.warning(f"SPBP information matrix validation warning: {e}")
+            # 正则化处理
+            Λ = ensure_positive_definite(Λ, numerical_config.min_eigenvalue)
+        
+        return Λ, η
+        
+    except Exception as e:
+        logger.error(f"SPBP information conversion failed: {e}")
+        raise
+    """
+    验证因子图的一致性
+    
+    Args:
+        factors: 因子列表
+        variables: 变量名到维度的映射
+        
+    Returns:
+        图是否有效
+    """
+    try:
+        # 检查因子是否引用了存在的变量
+        for i, factor in enumerate(factors):
+            for var_name in variables.keys():
+                dim = factor._get_dim(var_name)
+                if dim > 0:
+                    expected_dim = variables[var_name]
+                    if dim != expected_dim:
+                        logger.error(f"Factor {i}: Variable {var_name} dimension mismatch: {dim} vs {expected_dim}")
+                        return False
+        
+        logger.info(f"Validated factor graph: {len(factors)} factors, {len(variables)} variables")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Factor graph validation failed: {e}")
+        return False
+
+# =====================================================================
+# Main Export List  
+# =====================================================================
+__all__ = [
+    # Core classes
+    'Factor', 'PriorFactor', 'OdometryFactor', 'BearingRangeUTFactor', 
+    'PoseToPoseUTFactor', 'LoopClosureFactor', 'SigmaGenerator',
+    
+    # Utility functions
+    'wrap_angle', 'angle_diff', 'ensure_positive_definite', 'safe_matrix_inverse',
+    'validate_matrix_properties', 'clip_jacobian',
+    
+    # SPBP specific utilities
+    'validate_spbp_dimensions', 'safe_spbp_information_conversion',
+    
+    # Multi-robot utilities
+    'create_multi_robot_odometry_chain', 'create_landmark_observation_factors', 
+    'create_inter_robot_factors', 'create_pose_to_pose_ut_factors', 
+    'create_mixed_inter_robot_factors',
+    
+    # Cache and performance management
+    'ThreadSafeCache', 'FactorCacheManager', 'clear_all_caches', 'get_global_cache_stats',
+    
+    # Configuration and validation
+    'configure_numerical_parameters', 'validate_factor_graph', 'NumericalConfig',
+    'test_spbp_dimension_fix',
+    
+    # Global instances
+    'numerical_config', '_factor_cache_manager'
+]

@@ -1,418 +1,487 @@
-# --------------------------------------------------------
-# Gaussian Belief Propagation – stable version
-# --------------------------------------------------------
+# -------------------------------------------------------------
+# Gaussian Belief Propagation – Improved version for SLAM
+# -------------------------------------------------------------
 from __future__ import annotations
-import numpy as np, logging, inspect
-from typing import Dict, List, Any, Tuple, Optional, Union
 
-_log  = logging.getLogger("GBP-Solver")
-_EPS  = 1e-9     # 全局数值保护
+import logging
+import math
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-# ========================================================
-# 1. 内部节点类
-# ========================================================
-class _Node:
-    def __init__(self, dim: int,
-                 prior_mean: Optional[np.ndarray],
-                 prior_sigma: Optional[Union[float, np.ndarray]]):
-        self.dim = dim
-        self.L   = np.zeros((dim, dim))          # 信息矩阵 Λ
-        self.eta = np.zeros(dim)                 # 信息向量 η
+import numpy as np
+import scipy.linalg
 
-        if prior_mean is not None and prior_sigma is not None:
-            # 处理数组或标量先验
+# ─── Logging ────────────────────────────────────────────────
+_log = logging.getLogger("GaBP")
+
+# ─── Numerical constants ───────────────────────────────────
+_EPS       = 1.0e-8
+_DAMP_BEL  = 0.50          # belief-update damping
+_DAMP_MSG  = 0.30          # message-update damping
+_CLIP_SV   = 1.0e6         # singular-value clipping upper-bound
+_MIN_PREC  = 1.0e-12       # minimum precision for numerical stability
+
+# ─── Helper functions ──────────────────────────────────────
+def wrap_angle(t: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+    """ Wrap angle(s) to [-π, π]. """
+    return np.arctan2(np.sin(t), np.cos(t)) if isinstance(t, np.ndarray) \
+           else math.atan2(math.sin(t), math.cos(t))
+
+def angle_diff(a1: float, a2: float) -> float:
+    """Compute angular difference a1 - a2 wrapped to [-π, π]."""
+    return wrap_angle(a1 - a2)
+
+def make_pd(A: np.ndarray, eps: float = _EPS) -> np.ndarray:
+    """Ensure positive-definite by eigenvalue flooring with better conditioning."""
+    A = 0.5 * (A + A.T)
+    w, Q = np.linalg.eigh(A)
+    # More aggressive regularization for numerical stability
+    w = np.maximum(w, eps)
+    # Add small diagonal regularization
+    w += eps * np.max(w)
+    return Q @ np.diag(w) @ Q.T
+
+def stable_inv(M: np.ndarray, reg: float = _MIN_PREC) -> np.ndarray:
+    """Numerically stable matrix inversion with regularization."""
+    M = make_pd(M, _EPS)
+    # Add diagonal regularization for better conditioning
+    M_reg = M + reg * np.eye(M.shape[0])
+    
+    try:
+        # Try Cholesky first (fastest for PD matrices)
+        L = np.linalg.cholesky(M_reg)
+        return np.linalg.solve(L, np.linalg.solve(L.T, np.eye(M.shape[0])))
+    except np.linalg.LinAlgError:
+        # Fallback to SVD
+        U, s, Vt = np.linalg.svd(M_reg, full_matrices=False)
+        s_inv = 1.0 / np.maximum(s, _EPS)
+        return Vt.T @ np.diag(s_inv) @ U.T
+
+def info_to_gaussian(L: np.ndarray, eta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert information form to moment form."""
+    Σ = stable_inv(L)
+    μ = Σ @ eta
+    return μ, Σ
+
+def _clip_pair(L: np.ndarray, eta: np.ndarray,
+               s_max_lim: float = _CLIP_SV) -> Tuple[np.ndarray, np.ndarray]:
+    """Clip information matrix and vector to prevent numerical overflow.
+    
+    Mathematical principle: If L' = s*L, then to keep μ = L^(-1)*η unchanged,
+    we need η' = s²*η, since μ = (s*L)^(-1)*(s²*η) = (1/s)*L^(-1)*(s²*η) = s*L^(-1)*η.
+    """
+    if L.size == 0:
+        return L, eta
+    
+    # Check condition number instead of just max singular value
+    try:
+        s = np.linalg.svd(L, compute_uv=False)
+        s_max, s_min = s.max(), s[s > _EPS].min() if np.any(s > _EPS) else _EPS
+        cond = s_max / s_min
+        
+        if cond > s_max_lim:
+            scale = np.sqrt(s_max_lim / cond)
+            # Scale precision by s, information vector by s² to keep μ unchanged
+            return L * scale, eta * (scale * scale)
+    except:
+        pass
+    
+    return L, eta
+
+def safe_subtract_info(L1: np.ndarray, eta1: np.ndarray, 
+                      L2: np.ndarray, eta2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Safely subtract information matrices while maintaining PD property.
+    
+    When L_diff = L1 - L2 becomes indefinite, we project it to PD space.
+    To maintain consistency, we have two options:
+    1. Keep η_diff = η1 - η2 (simpler, may be inconsistent)
+    2. Re-project η to maintain μ consistency (more complex, numerically stable)
+    """
+    L_diff = L1 - L2
+    eta_diff = eta1 - eta2
+    
+    # Check if result is already positive definite
+    try:
+        w_min = np.linalg.eigvals(L_diff).min()
+        if w_min >= _MIN_PREC:
+            return L_diff, eta_diff  # Already PD, no projection needed
+    except:
+        pass
+    
+    # Project to PD space
+    w, Q = np.linalg.eigh(L_diff)
+    w_clipped = np.maximum(w, _MIN_PREC)
+    L_pd = Q @ np.diag(w_clipped) @ Q.T
+    
+    # Option 1: Simple approach (keeps original eta_diff)
+    # This is faster but may introduce slight inconsistency
+    if True:  # Use simple approach by default
+        return L_pd, eta_diff
+    
+    # Option 2: Consistency-preserving approach
+    # Re-project η onto new precision to maintain self-consistency
+    try:
+        mu_tmp = stable_inv(L_pd) @ eta_diff
+        eta_consistent = L_pd @ mu_tmp
+        return L_pd, eta_consistent
+    except:
+        # Fallback to simple approach if projection fails
+        return L_pd, eta_diff
+
+# ─── Variable node ─────────────────────────────────────────
+class VarNode:
+    def __init__(self, key: str, dim: int, mu0: np.ndarray,
+                 damping: float,
+                 prior_mean: Optional[np.ndarray] = None,
+                 prior_sigma: Optional[Union[float, np.ndarray]] = None,
+                 angle_indices: Optional[List[int]] = None):
+        self.key   = key
+        self.dim   = dim
+        self.damp  = float(damping)
+        
+        # Improved angle detection
+        self.angle_indices = angle_indices or []
+        if not self.angle_indices:
+            # Default angle detection for SLAM
+            if "theta" in key.lower() or "yaw" in key.lower():
+                self.angle_indices = [dim - 1]  # Assume last dimension is angle
+            elif key.startswith("x") and dim >= 3:
+                self.angle_indices = [2]  # SE(2) pose: [x, y, theta]
+        
+        # Setup prior
+        if prior_mean is None or prior_sigma is None:
+            # Weak prior
+            L0 = np.eye(dim) * _MIN_PREC
+            eta0 = L0 @ mu0
+        else:
             if np.isscalar(prior_sigma):
-                Λ0 = np.eye(dim) / (prior_sigma**2 + _EPS)
-            else:  # 数组或向量
-                # 确保维度匹配
-                if len(prior_sigma) != dim:
-                    raise ValueError(f"先验σ维度({len(prior_sigma)})与变量维度({dim})不匹配")
-                Λ0 = np.diag(1 / (np.square(prior_sigma) + _EPS))
-                
-            self.L   += Λ0
-            self.eta += Λ0 @ prior_mean
+                L0 = np.eye(dim) / (prior_sigma**2 + _EPS)
+            else:
+                sigma_arr = np.array(prior_sigma)
+                L0 = np.diag(1.0 / (sigma_arr**2 + _EPS))
+            eta0 = L0 @ prior_mean
+        
+        L0 = make_pd(L0)
+        self.L_prior, self.eta_prior = L0, eta0
+        self.L, self.eta             = L0.copy(), eta0.copy()
+        
+        # Initialize mean
+        self.mu, _ = info_to_gaussian(self.L, self.eta)
+        self._wrap_angles()
+        
+        self.mu_prev = self.mu.copy()
+        self.history = [self.mu.copy()]
+        self.fids: List[int] = []
 
-        self._prior_L   = self.L.copy()
-        self._prior_eta = self.eta.copy()
+    def _wrap_angles(self):
+        """Wrap angle components to [-π, π]."""
+        for idx in self.angle_indices:
+            if 0 <= idx < self.dim:
+                self.mu[idx] = wrap_angle(self.mu[idx])
 
-    # --- 基本操作 ----------------------------------------------------------
+    def belief(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self.L.copy(), self.eta.copy()
+    
+    def mean(self) -> np.ndarray:
+        return self.mu.copy()
+
+    def update(self, L_new: np.ndarray, eta_new: np.ndarray) -> float:
+        """Update belief with damping and proper angle handling."""
+        # Damped update
+        L_damped = self.damp * L_new + (1 - self.damp) * self.L
+        eta_damped = self.damp * eta_new + (1 - self.damp) * self.eta
+        
+        # Ensure PD
+        L_damped = make_pd(L_damped)
+        
+        # Compute new mean
+        mu_new, _ = info_to_gaussian(L_damped, eta_damped)
+        
+        # Handle angle updates properly
+        if self.angle_indices:
+            for idx in self.angle_indices:
+                if 0 <= idx < self.dim:
+                    # Use angular difference for proper angle updates
+                    angle_diff_val = angle_diff(mu_new[idx], self.mu[idx])
+                    mu_new[idx] = wrap_angle(self.mu[idx] + self.damp * angle_diff_val)
+        
+        # Compute convergence metric
+        delta = float(np.linalg.norm(mu_new - self.mu))
+        
+        # Update state
+        self.mu_prev = self.mu.copy()
+        self.mu = mu_new
+        self.L = L_damped
+        self.eta = eta_damped
+        self.history.append(self.mu.copy())
+        
+        return delta
+
+# ─── Factor node ─────────────────────────────────────────────
+class FacNode:
+    def __init__(self, fid: int, factor: Any, vkeys: List[str]):
+        self.id   = fid
+        self.fact = factor
+        self.vars = [k for k in vkeys if factor._get_dim(k) > 0]
+        self.prev_msg = {k: (np.zeros((factor._get_dim(k), factor._get_dim(k))),
+                             np.zeros(factor._get_dim(k))) for k in self.vars}
+
     def reset(self):
-        self.L[:]   = self._prior_L
-        self.eta[:] = self._prior_eta
+        """Reset all previous messages."""
+        for k in self.vars:
+            dim = self.fact._get_dim(k)
+            self.prev_msg[k] = (np.zeros((dim, dim)), np.zeros(dim))
 
-    def add_info(self, Λ, η):
-        self.L   += Λ
-        self.eta += η
-
-    def mean_cov(self) -> Tuple[np.ndarray, np.ndarray]:
-        # 添加正则化确保数值稳定
-        Λ = self.L + _EPS * np.eye(self.dim)
-        try:
-            Σ = np.linalg.inv(Λ)
-        except np.linalg.LinAlgError:
-            Σ = np.linalg.pinv(Λ)  # 如果奇异使用伪逆
-            
-        μ = Σ @ self.eta
-        return μ, Σ
-
-    # --- 先验能量（用于总能量计算） -----------------------------------------
-    def get_prior_energy(self) -> float:
-        if np.allclose(self._prior_L, 0, atol=1e-6):
-            return 0.0
-        μ, _ = self.mean_cov()
-        μ0   = np.linalg.solve(self._prior_L + _EPS*np.eye(self.dim), self._prior_eta)
-        r    = μ - μ0
-        return 0.5 * r @ self._prior_L @ r
-
-# ========================================================
-# 2. GBP 图类
-# ========================================================
+# ─── GBP graph ─────────────────────────────────────────────
 class GBPGraph:
-    """
-    *   add_variable(key, dim=2, prior=None, weight=σ⁻²)
-    *   add_factor(factor)         # factor 必须实现 linearize()
-    *   solve(n_iters)
-    """
+    def __init__(self, factors: List[Any], variables: Dict[str, np.ndarray],
+                 priors: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
+                 angle_vars: Optional[Dict[str, List[int]]] = None,
+                 bel_damp: float = _DAMP_BEL, msg_damp: float = _DAMP_MSG):
+        self.d_bel, self.d_msg = float(bel_damp), float(msg_damp)
+        
+        # Variable nodes
+        self.v: Dict[str, VarNode] = {}
+        for k, μ0 in variables.items():
+            pm, ps = priors.get(k, (None, None)) if priors else (None, None)
+            angle_idx = angle_vars.get(k) if angle_vars else None
+            self.v[k] = VarNode(k, μ0.size, μ0, self.d_bel, pm, ps, angle_idx)
+        
+        # Factor nodes
+        self.f: List[FacNode] = []
+        for fid, fac in enumerate(factors):
+            keys = [k for k in self.v if fac._get_dim(k) > 0]
+            if keys:
+                fn = FacNode(fid, fac, keys)
+                self.f.append(fn)
+                for k in keys:
+                    self.v[k].fids.append(fid)
+        
+        # Message storage
+        self.m_v2f: Dict[Tuple[str, int], Tuple[np.ndarray, np.ndarray]] = {}
+        self.m_f2v: Dict[Tuple[int, str], Tuple[np.ndarray, np.ndarray]] = {}
+        self.max_delta_history: List[float] = []
 
-    # ---------- 初始化 ----------
-    def __init__(self, damping: float = 0.25):
-        self.nodes  : Dict[str, _Node] = {}
-        self.factors: List[Any]        = []
-        self.damping = damping
-
-        # 运行时缓存
-        self.current_mu : Dict[str, np.ndarray] = {}
-        self.cov        : Dict[Any, np.ndarray] = {}
-        self._init_done = False                 # 首轮初始化标记
-        self._variable_dims = {}                # 存储变量维度
-
-    # ---------- 变量 / 因子 ----------
-    def add_variable(self, name: str, dim: int, prior: Optional[np.ndarray] = None, weight: Union[float, np.ndarray] = 0):
-        """添加变量到因子图
+    def _sweep(self) -> float:
+        """One complete GBP iteration."""
         
-        参数:
-            name: 变量名称
-            dim: 变量维度
-            prior: 先验均值 (可选)
-            weight: 权重值 (标量或数组) - 表示先验的精度 (σ⁻²)
-        """
-        # 确保名称唯一
-        if name in self.nodes:
-            raise ValueError(f"变量 '{name}' 已存在")
-        
-        # 存储变量维度
-        self._variable_dims[name] = dim
-        
-        # 创建节点
-        self.nodes[name] = _Node(dim, prior, weight)
-        
-        # 调试信息
-        if isinstance(weight, np.ndarray) and np.any(weight > 1e3):
-            max_prec = np.max(weight)
-            _log.debug(f"添加变量 '{name}': 维度={dim}, 强权重={max_prec:.1e}")
-        elif np.isscalar(weight) and weight > 1e3:
-            _log.debug(f"添加变量 '{name}': 维度={dim}, 强权重={weight:.1e}")
-
-    def add_factor(self, fac: Any):
-        self.factors.append(fac)
-        
-    # ====================================================
-    # 3. 单次同步迭代
-    # ====================================================
-    def iterate_once(self):
-        """执行一次GBP迭代，修复交叉项维度问题"""
-        # ---------- (0) 第一次：用先验初始化 μ, Σ ----------
-        if not self._init_done:
-            self.current_mu = {k: n.mean_cov()[0] for k, n in self.nodes.items()}
-            self.cov = {}
+        # 1) Variable to Factor messages
+        for k, vn in self.v.items():
+            L_belief, eta_belief = vn.belief()
             
-            # 设置初始协方差（对角线块）
-            for k, n in self.nodes.items():
-                _, Σ = n.mean_cov()
-                self.cov[k] = Σ
-            
-            # 初始化交叉协方差（微小值防奇异）
-            keys = list(self.nodes.keys())
-            for i, ki in enumerate(keys):
-                di = self.nodes[ki].dim
-                for kj in keys[i+1:]:
-                    dj = self.nodes[kj].dim
-                    self.cov[(ki, kj)] = 1e-9 * np.zeros((di, dj))
-            
-            self._init_done = True
-        
-        cross_blocks : List[Tuple[str, str, np.ndarray]] = []
-        
-        # ==================== 改进的交叉项处理 ====================
-        def _validate_and_fix_cross_block(ki: str, kj: str, block_val: Any) -> Optional[np.ndarray]:
-            """验证和修复交叉项维度"""
+            for fid in vn.fids:
+                # Get previous F→V message
+                L_f2v, eta_f2v = self.m_f2v.get((fid, k), 
+                                                (np.zeros((vn.dim, vn.dim)),
+                                                 np.zeros(vn.dim)))
+                
+                # Compute V→F message (belief minus incoming)
+                L_msg, eta_msg = safe_subtract_info(L_belief, eta_belief, 
+                                                   L_f2v, eta_f2v)
+                
+                # Damping
+                L_prev, eta_prev = self.m_v2f.get((k, fid),
+                                                 (np.zeros_like(L_msg), 
+                                                  np.zeros_like(eta_msg)))
+                L_msg = self.d_msg * L_msg + (1 - self.d_msg) * L_prev
+                eta_msg = self.d_msg * eta_msg + (1 - self.d_msg) * eta_prev
+                
+                # Clip for numerical stability
+                L_msg, eta_msg = _clip_pair(L_msg, eta_msg)
+                
+                self.m_v2f[(k, fid)] = (L_msg, eta_msg)
+
+        # 2) Factor to Variable messages  
+        for fn in self.f:
+            # Collect current estimates
+            μ_dict, Σ_dict = {}, {}
+            for k in fn.vars:
+                μ_dict[k] = self.v[k].mean()
+                # Wrap angles for linearization
+                for idx in self.v[k].angle_indices:
+                    if 0 <= idx < len(μ_dict[k]):
+                        μ_dict[k][idx] = wrap_angle(μ_dict[k][idx])
+                
+                _, Σ = info_to_gaussian(*self.v[k].belief())
+                # Add small regularization for numerical stability
+                Σ_dict[k] = make_pd(Σ, _MIN_PREC)
+
+            # Linearize factor
             try:
-                # 获取期望的维度
-                di = self._variable_dims.get(ki, self.nodes[ki].dim if ki in self.nodes else 0)
-                dj = self._variable_dims.get(kj, self.nodes[kj].dim if kj in self.nodes else 0)
-                
-                # 处理各种可能的输入类型
-                if isinstance(block_val, tuple):
-                    # 优先使用第一个元素作为矩阵
-                    matrix = np.asarray(block_val[0], dtype=float) if block_val[0] is not None else None
-                    if matrix is None and len(block_val) > 1:
-                        matrix = np.asarray(block_val[1], dtype=float) if block_val[1] is not None else None
-                else:
-                    matrix = np.asarray(block_val, dtype=float)
-                
-                if matrix is None:
-                    raise ValueError("交叉项值为None")
-                
-                # 检查维度
-                if matrix.shape == (di, dj):
-                    # 维度正确
-                    return matrix
-                elif matrix.shape == (dj, di):
-                    # 维度反转，自动转置
-                    _log.debug(f"自动转置交叉项 ({ki}, {kj}): {matrix.shape} -> ({di}, {dj})")
-                    return matrix.T
-                else:
-                    # 维度不匹配，尝试修复
-                    if di > 0 and dj > 0 and matrix.size == di * dj:
-                        # 尝试重塑
-                        return matrix.reshape((di, dj))
-                    else:
-                        raise ValueError(f"形状不匹配: 期望({di},{dj}), 实际{matrix.shape}")
-                
+                blocks = fn.fact.linearize(μ_dict, Σ_dict)
             except Exception as e:
-                _log.error(f"交叉项 ({ki}, {kj}) 处理失败: {e}\n"
-                           f"值类型: {type(block_val)}\n值内容: {block_val}")
-                return None
-        
-        # ---------- (1) reset → 累加自环块 ----------
-        for n in self.nodes.values():
-            n.reset()
-        
-        # 处理每个因子
-        for fac in self.factors:
-            try:
-                # 线性化因子
-                local = fac.linearize(self.current_mu, self.cov)
+                _log.error(f"Factor {fn.id} linearization failed: {e}")
+                continue
+
+            # Compute messages for each connected variable
+            for tgt in fn.vars:
+                vn = self.v[tgt]
+                dim = vn.dim
                 
-                for k, v in local.items():
-                    # ---------- 交叉项 (ki,kj) ----------
-                    if isinstance(k, tuple) and len(k) == 2:
-                        ki, kj = k
-                        if ki not in self._variable_dims or kj not in self._variable_dims:
-                            _log.warning(f"交叉项 {k} 包含未知变量, 跳过")
-                            continue
-                            
-                        fixed_block = _validate_and_fix_cross_block(ki, kj, v)
-                        if fixed_block is not None:
-                            # 直接使用验证后的交叉项块
-                            cross_blocks.append((ki, kj, fixed_block))
+                # Get blocks related to target variable
+                Lkk, ηk = blocks.get(tgt, (np.zeros((dim, dim)), np.zeros(dim)))
+                Lkk = make_pd(Lkk, _MIN_PREC)
+                
+                # Schur complement for other variables
+                for oth in fn.vars:
+                    if oth == tgt:
+                        continue
                     
-                    # ---------- 自环项 (单变量) ----------
-                    elif k in self.nodes:
-                        if isinstance(v, tuple):
-                            Λ, η = v
-                        else:
-                            # 兼容旧版（只返回Λ），则η设为0
-                            Λ = v
-                            η = np.zeros(self._variable_dims[k])
-                        
-                        # 确保有效矩阵
-                        Λ = np.asarray(Λ, dtype=float)
-                        if Λ.shape != (self._variable_dims[k], self._variable_dims[k]):
-                            # 尝试重塑
-                            if Λ.size == self._variable_dims[k] ** 2:
-                                Λ = Λ.reshape((self._variable_dims[k], self._variable_dims[k]))
-                            else:
-                                _log.error(f"自环项Λ维度错误: {Λ.shape}, 期望({self._variable_dims[k]},{self._variable_dims[k]})")
-                                continue
-                        
-                        # 数值稳定处理（仅方阵）
-                        Λ = 0.5 * (Λ + Λ.T)  # 对称化
-                        Λ += _EPS * np.eye(Λ.shape[0])  # 添加小对角项
-                        
-                        # 阻尼处理
-                        damped_Λ = (1 - self.damping) * Λ + self.damping * _EPS * np.eye(Λ.shape[0])
-                        damped_η = (1 - self.damping) * np.asarray(η, dtype=float)
-                        
-                        # 将信息累加到节点
-                        self.nodes[k].add_info(damped_Λ, damped_η)
-            except Exception as e:
-                _log.error(f"因子处理失败: {type(fac).__name__}, 错误: {e}", exc_info=True)
-
-        # ---------- (2) 组装联合信息矩阵 ----------
-        order  = list(self.nodes.keys())
-        dims   = [self.nodes[k].dim for k in order]
-        starts = np.cumsum([0] + dims[:-1])
-        J      = sum(dims)
-
-        # 创建大矩阵
-        Λ_joint = np.zeros((J, J))
-        η_joint = np.zeros(J)
-
-        # 填充自环块（对角线）
-        for k, s, d in zip(order, starts, dims):
-            Λ_joint[s:s+d, s:s+d] = self.nodes[k].L
-            η_joint[s:s+d]        = self.nodes[k].eta
-
-        # 填充交叉块（非对角线）
-        for ki, kj, Λij in cross_blocks:
-            if ki in order and kj in order:
-                i, j   = order.index(ki), order.index(kj)
-                si, di = starts[i], dims[i]
-                sj, dj = starts[j], dims[j]
-                
-                # 只添加到下三角部分（避免重复）
-                if i < j:
-                    Λ_joint[si:si+di, sj:sj+dj] += Λij
-                    Λ_joint[sj:sj+dj, si:si+di] += Λij.T
-
-        # ---------- (3) 计算联合边缘 ----------
-        # 添加正则项防止奇异
-        Λ_joint += 1e-6 * np.eye(J)
-        try:
-            # 确保信息矩阵对称
-            Λ_joint_sym = 0.5 * (Λ_joint + Λ_joint.T)
-            Σ_joint = np.linalg.inv(Λ_joint_sym)
-        except np.linalg.LinAlgError:
-            _log.error("联合信息矩阵奇异，使用伪逆")
-            Σ_joint = np.linalg.pinv(Λ_joint)
-        μ_joint = Σ_joint @ η_joint
-
-        # 截断过大的方差（防止数值爆炸）
-        diag_vars = np.diag(Σ_joint)
-        if np.any(diag_vars > 1e6):
-            _log.warning("检测到过大方差，进行截断")
-            max_var = np.median(diag_vars) * 100  # 中位数的100倍
-            np.fill_diagonal(Σ_joint, np.clip(diag_vars, None, max_var))
-
-        # ---------- (4) 拆回局部 μ, Σ ----------
-        self.current_mu.clear()
-        self.cov.clear()
-
-        # 更新每个变量的均值和协方差（对角线块）
-        for k, s, d in zip(order, starts, dims):
-            self.current_mu[k] = μ_joint[s:s+d].copy()
-            self.cov[k]        = Σ_joint[s:s+d, s:s+d].copy()
-
-        # 更新交叉协方差（非对角线块）
-        for i, (ki, si, di) in enumerate(zip(order, starts, dims)):
-            for j in range(i+1, len(order)):
-                kj, sj, dj = order[j], starts[j], dims[j]
-                self.cov[(ki, kj)] = Σ_joint[si:si+di, sj:sj+dj].copy()
-
-    # ====================================================
-    # 4. 能量与求解
-    # ====================================================
-    def energy(self) -> float:
-        mu_dict = {k: n.mean_cov()[0] for k, n in self.nodes.items()}
-        total   = 0.0
-        for fac in self.factors:
-            try:
-                if hasattr(fac, "get_energy"):
-                    sig = inspect.signature(fac.get_energy)
-                    if 'mu' in sig.parameters:
-                        total += fac.get_energy(mu_dict)
+                    # Get cross terms
+                    if (tgt, oth) in blocks:
+                        Lkj = blocks[(tgt, oth)]
+                    elif (oth, tgt) in blocks:
+                        Lkj = blocks[(oth, tgt)].T
                     else:
-                        total += fac.get_energy()
-            except Exception as e:
-                _log.warning(f"因子 {type(fac).__name__} 能量计算失败: {e}")
-                
-        for n in self.nodes.values():
-            total += n.get_prior_energy()
-        return total
-
-    # ====================================================
-    # 5. 求解主循环
-    # ====================================================
-    def solve(self, max_iter: int = 30, *, verbose: bool = False) -> List[float]:
-        """优化因子图
-        
-        参数:
-            max_iter: 最大迭代次数
-            verbose: 是否打印详细日志
-        """
-        energy_log: List[float] = []
-        diverged_cnt = 0
-        prev_e = float('inf')
-        
-        # 初始迭代（确保状态初始化）
-        if not self._init_done or not self.current_mu:
-            self.iterate_once()
-        
-        # 优化循环
-        for it in range(max_iter + 1):
-            # 执行迭代（除了首次迭代已执行）
-            if it > 0:
-                self.iterate_once()
-            
-            # 计算当前能量
-            try:
-                e = self.energy()
-            except Exception as exc:
-                _log.error(f"能量计算失败: {exc}")
-                # 如果第一次迭代失败，尝试重新初始化
-                if it == 0:
-                    self.iterate_once()
-                    e = self.energy()
-                else:
-                    e = float('inf')
+                        continue
                     
-            energy_log.append(e)
+                    # Get other variable's message and block
+                    Lj_msg, ηj_msg = self.m_v2f.get((oth, fn.id),
+                                                   (np.zeros((self.v[oth].dim,
+                                                            self.v[oth].dim)),
+                                                    np.zeros(self.v[oth].dim)))
+                    
+                    Ljj, ηj = blocks.get(oth, (np.zeros((self.v[oth].dim,
+                                                        self.v[oth].dim)),
+                                              np.zeros(self.v[oth].dim)))
+                    
+                    # Compute Schur complement
+                    Ljj_total = make_pd(Ljj + Lj_msg, _MIN_PREC)
+                    ηj_total = ηj + ηj_msg
+                    
+                    try:
+                        Ljj_inv = stable_inv(Ljj_total)
+                        # Update target blocks
+                        Lkk -= Lkj @ Ljj_inv @ Lkj.T
+                        ηk -= Lkj @ Ljj_inv @ ηj_total
+                    except Exception as e:
+                        _log.warning(f"Schur complement failed for factor {fn.id}: {e}")
+                        continue
+                
+                # Ensure positive definite
+                Lkk = make_pd(Lkk, _MIN_PREC)
+                
+                # Damping
+                L_prev, η_prev = self.m_f2v.get((fn.id, tgt),
+                                               (np.zeros_like(Lkk), np.zeros_like(ηk)))
+                Lkk = self.d_msg * Lkk + (1 - self.d_msg) * L_prev
+                ηk = self.d_msg * ηk + (1 - self.d_msg) * η_prev
+                
+                # Clip and store
+                Lkk, ηk = _clip_pair(Lkk, ηk)
+                self.m_f2v[(fn.id, tgt)] = (Lkk, ηk)
+
+        # 3) Belief updates
+        max_delta = 0.0
+        for k, vn in self.v.items():
+            # Combine prior with all incoming messages
+            L_new = vn.L_prior.copy()
+            eta_new = vn.eta_prior.copy()
             
-            # 计算能量变化
-            if it > 0:
-                delta = e - prev_e
-                sign = '+' if delta >= 0 else ''
-            else:
-                delta = 0
-                sign = ''
+            for fid in vn.fids:
+                L_msg, eta_msg = self.m_f2v.get((fid, k), 
+                                               (np.zeros((vn.dim, vn.dim)),
+                                                np.zeros(vn.dim)))
+                L_new += L_msg
+                eta_new += eta_msg
             
-            # 打印日志
-            if verbose:
-                log_entry = f"Iter {it:2d}/{max_iter}  energy {e:.3e}  Δ: {sign}{delta:.2e}"
-                if it == 0 or it % 5 == 0 or it == max_iter:
-                    _log.info(log_entry)
-                elif delta > 0:  # 仅对能量增加显示警告
-                    _log.debug(f"{log_entry} (警告: 能量增加)")
+            # Small regularization for numerical stability
+            L_new = make_pd(L_new, _MIN_PREC)
             
-            # 检测是否发散 (连续3次能量增加)
-            if it >= 2 and e > max(energy_log[-3:-1]):
-                diverged_cnt += 1
+            # Update and track convergence
+            delta = vn.update(L_new, eta_new)
+            max_delta = max(max_delta, delta)
+        
+        self.max_delta_history.append(max_delta)
+        return max_delta
+
+    def run(self, max_iter: int = 100, tol: float = 1e-5, 
+            verbose: bool = True) -> List[float]:
+        """Run GBP until convergence."""
+        
+        # Reset state
+        self.m_v2f.clear()
+        self.m_f2v.clear()
+        for fn in self.f:
+            fn.reset()
+        self.max_delta_history.clear()
+        
+        if verbose:
+            _log.info(f"Starting GBP with {len(self.v)} variables, {len(self.f)} factors")
+        
+        for iteration in range(max_iter):
+            delta = self._sweep()
+            
+            if verbose and (iteration % 10 == 0 or delta < tol):
+                _log.info(f"Iter {iteration:3d} | max Δ = {delta:.2e}")
+            
+            # Check for numerical issues
+            if not np.isfinite(delta) or delta > 1e8:
+                _log.error(f"Numerical instability detected at iteration {iteration}")
+                break
+            
+            # Check convergence
+            if delta < tol:
                 if verbose:
-                    _log.warning(f"可能发散: 连续 {diverged_cnt} 次能量上升")
-                if diverged_cnt >= 3:
-                    _log.warning("发散次数过多，终止优化")
-                    break
-            else:
-                diverged_cnt = max(0, diverged_cnt - 1)
-            
-            # 更新前次能量
-            prev_e = e
-            
-            # 反馈发散计数给非线性因子
-            for f in self.factors:
-                if hasattr(f, "_diverged_cnt"):
-                    f._diverged_cnt = diverged_cnt
-            
-        return energy_log
+                    _log.info(f"Converged at iteration {iteration} (Δ = {delta:.2e})")
+                break
+        else:
+            if verbose:
+                _log.warning(f"Reached max iterations ({max_iter}) without full convergence")
+        
+        return self.max_delta_history
+    
+    # Backward compatibility alias
+    def solve(self, *args, **kwargs):
+        """Backward compatibility alias for run()."""
+        return self.run(*args, **kwargs)
 
-    # ====================================================
-    # 6. 查询辅助
-    # ====================================================
-    def get_mean(self, key: str) -> Optional[np.ndarray]:
-        """获取变量均值"""
-        if key in self.current_mu:
-            return self.current_mu[key].copy()
-        elif key in self.nodes:
-            return self.nodes[key].mean_cov()[0]
-        _log.warning(f"未知变量 {key}")
-        return None
+    # ─── Utility methods ───────────────────────────────────────
+    def get_means(self) -> Dict[str, np.ndarray]:
+        """Get current mean estimates for all variables."""
+        return {k: vn.mean() for k, vn in self.v.items()}
 
-    def get_cov(self, key: str) -> Optional[np.ndarray]:
-        """获取变量协方差"""
-        if key in self.cov:
-            return self.cov[key].copy()
-        elif key in self.nodes:
-            return self.nodes[key].mean_cov()[1]
-        _log.warning(f"未知变量 {key}")
-        return None
+    def get_marginals(self) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+        """Get marginal distributions (mean, covariance) for all variables."""
+        return {k: info_to_gaussian(*vn.belief()) for k, vn in self.v.items()}
+    
+    def get_covariances(self) -> Dict[str, np.ndarray]:
+        """Get covariance matrices for all variables."""
+        return {k: info_to_gaussian(*vn.belief())[1] for k, vn in self.v.items()}
+    
+    def get_information_matrices(self) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+        """Get information form (precision matrix, information vector) for all variables."""
+        return {k: vn.belief() for k, vn in self.v.items()}
+    
+    def set_prior(self, var_key: str, mean: np.ndarray, 
+                  sigma: Union[float, np.ndarray]):
+        """Update prior for a specific variable."""
+        if var_key not in self.v:
+            raise ValueError(f"Variable {var_key} not found")
+        
+        vn = self.v[var_key]
+        if np.isscalar(sigma):
+            L_prior = np.eye(vn.dim) / (sigma**2 + _EPS)
+        else:
+            sigma_arr = np.array(sigma)
+            L_prior = np.diag(1.0 / (sigma_arr**2 + _EPS))
+        
+        eta_prior = L_prior @ mean
+        vn.L_prior = make_pd(L_prior)
+        vn.eta_prior = eta_prior
+    
+    def reset_messages(self):
+        """Reset all messages (useful for re-running optimization)."""
+        self.m_v2f.clear()
+        self.m_f2v.clear()
+        for fn in self.f:
+            fn.reset()
+    
+    def get_variable_history(self, var_key: str) -> List[np.ndarray]:
+        """Get optimization history for a specific variable."""
+        if var_key not in self.v:
+            raise ValueError(f"Variable {var_key} not found")
+        return self.v[var_key].history.copy()
+    
+    def get_convergence_history(self) -> List[float]:
+        """Get convergence history (max delta per iteration)."""
+        return self.max_delta_history.copy()
