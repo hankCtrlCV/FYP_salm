@@ -24,12 +24,12 @@ from collections import defaultdict, Counter
 import warnings
 import time
 from dataclasses import dataclass
+from utils.cfg_loader import load_gbp
 
-# ✅ 完整导入新版本factor_ut
 from algorithm.frontend.factor_ut import (
     # Core factor classes
     PriorFactor, OdometryFactor, BearingRangeUTFactor, LoopClosureFactor,
-    PoseToPoseUTFactor,  # ✅ 新增：多机器人间位姿观测
+    PoseToPoseUTFactor, 
     
     # Utility functions  
     wrap_angle, ensure_positive_definite, safe_matrix_inverse,
@@ -57,7 +57,7 @@ class GraphBuildStats:
     odometry_factors: int = 0
     observation_factors: int = 0
     loop_closure_factors: int = 0
-    inter_robot_factors: int = 0  # ✅ 新增
+    inter_robot_factors: int = 0  # 
     
     connected_variables: int = 0
     disconnected_variables: int = 0
@@ -77,6 +77,7 @@ class GBPGraphBuilder:
     
     # ✅ 更新的默认配置，集成新特性
     _DEFAULT_CONFIG = {
+        # **load_gbp(),
         # Prior constraints
         "prior_sigma_xy": 0.05,
         "prior_sigma_theta": 0.02,

@@ -1,0 +1,13 @@
+# configs/slam_gbp.yaml
+ut:                # 只对 GBP 有意义
+  mode:            "auto"
+  alpha:           0.1
+  beta:            2.0
+  kappa:           0.0
+  linear_thresh:   4.0
+  residual_thresh: 2.5
+
+performance:
+  enable_vectorization:   true
+  enable_batch_processing: true
+  enable_factor_reordering: true
