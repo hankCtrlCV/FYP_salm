@@ -690,7 +690,7 @@ class PriorFactor(Factor):
         return self.prior.shape[0] if key == self.var else 0
 
 # =====================================================================
-# Enhanced Odometry Factor
+# Odometry Factor
 # =====================================================================
 class OdometryFactor(Factor):
     """
@@ -888,7 +888,7 @@ class OdometryFactor(Factor):
         return 3 if key in (self.v1, self.v2) else 0
 
 # =====================================================================
-# Enhanced Bearing-Range Factor with UT
+# Bearing-Range Factor with UT
 # =====================================================================
 class BearingRangeUTFactor(Factor):
     """
@@ -1345,26 +1345,33 @@ class BearingRangeUTFactor(Factor):
 # =====================================================================
 class PoseToPoseUTFactor(Factor):
     """
-    Pose-to-Pose UT因子用于多机器人间的相对位姿观测
+    Pose-to-Pose 方位-距离因子用于多机器人间的观测 (2-DOF版本)
+    
+    注意：这是一个 2-DOF (bearing-range) 版本，不同于传统的 3-DOF 相对位姿因子。
     
     支持以下场景：
-    - Robot A 通过视觉/雷达观测到 Robot B 的相对位置
-    - 机器人间的直接位姿测量
+    - Robot A 通过激光雷达观测到 Robot B 的相对位置（bearing-range）
+    - 机器人间的位置观测（不包括朝向）
     - 支持GBP和SPBP模式自动切换
+    
+    观测模型：
+    - 输入：两个 3-DOF 位姿 (x1, y1, θ1) 和 (x2, y2, θ2)
+    - 输出：2-DOF 观测 [bearing, range]
+    - 注意：θ2 对观测没有贡献，因此信息矩阵 Λ2 需要正则化
     """
     
-    def __init__(self, pose1_key: str, pose2_key: str, relative_pose: np.ndarray, 
+    def __init__(self, pose1_key: str, pose2_key: str, measurement: np.ndarray, 
                  R: np.ndarray, mode: str = "auto", alpha: float = 1e-3, 
                  beta: float = 2.0, kappa: float = 0.0,
                  distance_threshold: float = 10.0, residual_sigma_thresh: float = 2.5):
         """
-        初始化Pose-to-Pose UT因子
+        初始化Pose-to-Pose方位-距离因子
         
         Args:
             pose1_key: 第一个位姿变量名 (观测者)
             pose2_key: 第二个位姿变量名 (被观测者)
-            relative_pose: 观测的相对位姿 [dx, dy, dθ] (在pose1坐标系下)
-            R: 观测噪声协方差矩阵 (3x3)
+            measurement: 观测的方位和距离 [bearing, range] (2DOF)
+            R: 观测噪声协方差矩阵 (2x2)
             mode: "auto", "gbp", 或 "spbp"
             alpha, beta, kappa: UT参数
             distance_threshold: GBP/SPBP切换的距离阈值
@@ -1375,15 +1382,15 @@ class PoseToPoseUTFactor(Factor):
         # 基本参数
         self.pose1_key = pose1_key  # 观测者位姿
         self.pose2_key = pose2_key  # 被观测者位姿
-        self.z_relative = np.asarray(relative_pose, dtype=float)
+        self.z = np.asarray(measurement, dtype=float)
         
-        if self.z_relative.size != 3:
-            raise ValueError(f"Relative pose must be 3D [dx, dy, dθ], got {self.z_relative.shape}")
+        if self.z.size != 2:
+            raise ValueError(f"Measurement must be [bearing, range], got {self.z.shape}")
         
         # 噪声模型验证
         R = np.asarray(R, dtype=float)
-        if R.shape != (3, 3):
-            raise ValueError(f"R must be 3x3, got {R.shape}")
+        if R.shape != (2, 2):
+            raise ValueError(f"R must be 2x2, got {R.shape}")
         
         try:
             validate_matrix_properties(R, "pose_to_pose_noise_covariance", 
@@ -1414,23 +1421,22 @@ class PoseToPoseUTFactor(Factor):
         self._current_mode = "gbp"
         self._mode_history = []
         
-        # 使用全局缓存管理器
-        
         # 预分配工作数组
+        # 注意：这些数组在因子实例间共享，如需多线程使用请在调度器层面保证同步
         self._work_arrays = {
-            'residual': np.zeros(3),
-            'prediction': np.zeros(3),
+            'residual': np.zeros(2),
+            'prediction': np.zeros(2),
             'joint_state': np.zeros(6),      # [pose1, pose2]
             'joint_cov': np.zeros((6, 6)),   # 6x6联合协方差
-            'jacobian_pose1': np.zeros((3, 3)),
-            'jacobian_pose2': np.zeros((3, 3))
+            'jacobian_pose1': np.zeros((2, 3)),
+            'jacobian_pose2': np.zeros((2, 3))
         }
         
-        logger.debug(f"Created pose-to-pose UT factor {pose1_key} -> {pose2_key}, mode={mode}")
+        logger.debug(f"Created pose-to-pose bearing-range factor {pose1_key} -> {pose2_key}, mode={mode}")
     
     def linearize(self, mu: Dict[str, np.ndarray], cov: Dict[str, np.ndarray]) -> Dict:
         """
-        使用自适应GBP/SPBP模式线性化pose-to-pose因子
+        使用自适应GBP/SPBP模式线性化pose-to-pose bearing-range因子
         """
         # 输入验证
         if self.pose1_key not in mu or self.pose2_key not in mu:
@@ -1477,8 +1483,8 @@ class PoseToPoseUTFactor(Factor):
             
             # 计算预测和残差
             self._work_arrays['prediction'][:] = self._observation_model(self._work_arrays['joint_state'])
-            self._work_arrays['residual'][:] = self.z_relative - self._work_arrays['prediction']
-            self._work_arrays['residual'][2] = wrap_angle(self._work_arrays['residual'][2])  # 包装角度残差
+            self._work_arrays['residual'][:] = self.z - self._work_arrays['prediction']
+            self._work_arrays['residual'][0] = wrap_angle(self._work_arrays['residual'][0])  # 包装角度残差
             
             # 计算位姿间距离用于模式选择
             dx, dy = μ2[0] - μ1[0], μ2[1] - μ1[1]
@@ -1493,29 +1499,31 @@ class PoseToPoseUTFactor(Factor):
                                             joint_cov_pd, 
                                             self._work_arrays['residual'])
             else:
-                result = self._gbp_linearize(μ1, μ2, self._work_arrays['residual'])
+                result = self._gbp_linearize(μ1, μ2, self._work_arrays['residual'], 
+                                           distance, dx, dy)
             
             # 验证并返回结果
             if self.validate_linearization_result(result):
                 return result
             else:
                 logger.warning(f"Validation failed for {selected_mode}, falling back to GBP")
-                return self._gbp_linearize(μ1, μ2, self._work_arrays['residual'])
+                return self._gbp_linearize(μ1, μ2, self._work_arrays['residual'], 
+                                         distance, dx, dy)
                 
         except Exception as e:
             logger.error(f"Pose-to-pose linearization failed: {e}")
             return self._get_zero_blocks()
     
     def get_energy(self, mu: Dict[str, np.ndarray]) -> float:
-        """计算pose-to-pose因子能量"""
+        """计算pose-to-pose bearing-range因子能量"""
         if self.pose1_key not in mu or self.pose2_key not in mu:
             return 0.0
         
         try:
             joint_state = np.hstack([mu[self.pose1_key], mu[self.pose2_key]])
             prediction = self._observation_model(joint_state)
-            residual = self.z_relative - prediction
-            residual[2] = wrap_angle(residual[2])
+            residual = self.z - prediction
+            residual[0] = wrap_angle(residual[0])
             return 0.5 * residual @ self.Rinv @ residual
         except Exception as e:
             logger.error(f"Pose-to-pose energy computation failed: {e}")
@@ -1565,19 +1573,24 @@ class PoseToPoseUTFactor(Factor):
     @staticmethod
     def _observation_model(x: np.ndarray) -> np.ndarray:
         """
-        Pose-to-pose观测模型：计算pose1坐标系下的pose2相对位姿
+        Pose-to-pose bearing-range观测模型
         
         Args:
             x: 联合状态 [x1, y1, θ1, x2, y2, θ2]
             
         Returns:
-            相对位姿 [dx, dy, dθ] (在pose1坐标系下)
+            观测 [bearing, range] (从pose1观测pose2)
         """
-        pose1 = x[:3]  # [x1, y1, θ1]
-        pose2 = x[3:]  # [x2, y2, θ2]
+        x1, y1, theta1 = x[:3]
+        x2, y2, _ = x[3:]  # 忽略θ2，因为只观测位置
         
-        # 使用已有的SE(2)相对位姿计算
-        return OdometryFactor._se2_relative_pose(pose1, pose2)
+        dx = x2 - x1
+        dy = y2 - y1
+        
+        range_pred = math.hypot(dx, dy)
+        bearing_pred = wrap_angle(math.atan2(dy, dx) - theta1)
+        
+        return np.array([bearing_pred, range_pred])
     
     def _select_mode(self, distance: float, residual: np.ndarray) -> str:
         """
@@ -1587,20 +1600,20 @@ class PoseToPoseUTFactor(Factor):
             return self.mode
         
         with self._state_lock:
-            # 对于很远的距离或大的角度差，倾向于使用SPBP
+            # 对于很远的距离或大的误差，倾向于使用SPBP
             large_distance = distance > self.distance_threshold
             
             # 分析残差幅度
-            σ_trans = math.sqrt((self.R[0, 0] + self.R[1, 1]) / 2)  # 平移噪声
-            σ_rot = math.sqrt(self.R[2, 2])  # 旋转噪声
+            σ_bearing = math.sqrt(self.R[0, 0])
+            σ_range = math.sqrt(self.R[1, 1])
             
-            large_translation_error = math.hypot(residual[0], residual[1]) > self.residual_sigma_thresh * σ_trans
-            large_rotation_error = abs(residual[2]) > self.residual_sigma_thresh * σ_rot
+            large_bearing_error = abs(residual[0]) > self.residual_sigma_thresh * σ_bearing
+            large_range_error = abs(residual[1]) > self.residual_sigma_thresh * σ_range
             
             # 模式切换逻辑
-            if large_distance or large_translation_error or large_rotation_error:
+            if large_distance or large_bearing_error or large_range_error:
                 self._diverged_count += 1
-                if self._diverged_count > 1:  # 较为宽松的切换条件
+                if self._diverged_count > 2:
                     self._current_mode = "spbp"
             else:
                 self._diverged_count = max(0, self._diverged_count - 1)
@@ -1615,28 +1628,49 @@ class PoseToPoseUTFactor(Factor):
             
             return self._current_mode
     
-    def _gbp_linearize(self, μ1: np.ndarray, μ2: np.ndarray, residual: np.ndarray) -> Dict:
+    def _gbp_linearize(self, μ1: np.ndarray, μ2: np.ndarray, residual: np.ndarray,
+                       distance: float, dx: float, dy: float) -> Dict:
         """
-        标准GBP线性化：计算相对位姿的雅可比矩阵
+        标准GBP线性化：计算bearing-range观测的雅可比矩阵
         """
         try:
-            # 计算当前相对位姿用于雅可比计算
-            current_relative = self._observation_model(np.hstack([μ1, μ2]))
+            # 对极小距离的特殊处理
+            if distance < numerical_config.min_eigenvalue**0.5:
+                logger.warning(f"Very small distance {distance:.6f} between poses, returning minimal information")
+                # 返回极小的信息矩阵，避免数值问题
+                min_info = numerical_config.min_eigenvalue * np.eye(3)
+                return {
+                    self.pose1_key: (min_info, np.zeros(3)),
+                    self.pose2_key: (min_info, np.zeros(3)),
+                    (self.pose1_key, self.pose2_key): np.zeros((3, 3)),
+                    (self.pose2_key, self.pose1_key): np.zeros((3, 3))
+                }
             
-            # 使用SE(2)伴随逆矩阵作为雅可比（类似OdometryFactor）
-            # ∂(relative_pose)/∂pose1 = Adj^{-1}(current_relative)
-            # ∂(relative_pose)/∂pose2 = -I
-            J1 = OdometryFactor._se2_adjoint_inverse(current_relative)
-            J2 = -np.eye(3)
+            # 确保距离计算的数值稳定性
+            safe_distance = max(distance, numerical_config.min_eigenvalue**0.5)
+            q = safe_distance ** 2  # 距离的平方
+            
+            # 计算雅可比矩阵（与BearingRangeUTFactor类似）
+            # 对于方位 = atan2(dy, dx) - theta1
+            self._work_arrays['jacobian_pose1'][0, :] = [dy/q, -dx/q, -1.0]
+            self._work_arrays['jacobian_pose2'][0, :] = [-dy/q, dx/q, 0.0]  # 对θ2的导数为0
+            
+            # 对于距离 = sqrt(dx² + dy²)  
+            self._work_arrays['jacobian_pose1'][1, :] = [-dx/safe_distance, -dy/safe_distance, 0.0]
+            self._work_arrays['jacobian_pose2'][1, :] = [dx/safe_distance, dy/safe_distance, 0.0]
             
             # 数值裁剪
-            J1 = clip_jacobian(J1)
-            J2 = clip_jacobian(J2)
+            J1 = clip_jacobian(self._work_arrays['jacobian_pose1'])
+            J2 = clip_jacobian(self._work_arrays['jacobian_pose2'])
             
             # 信息矩阵块
             Λ1 = J1.T @ self.Rinv @ J1
             Λ2 = J2.T @ self.Rinv @ J2
             Λ12 = J1.T @ self.Rinv @ J2
+            
+            # 由于观测对 θ2 无贡献，Λ2 的第3行/列为0，需要正则化
+            # 给 θ2 加一个极小的先验信息，避免奇异性
+            Λ2[2, 2] += numerical_config.min_eigenvalue
             
             # 信息向量块
             η1 = J1.T @ self.Rinv @ residual
@@ -1660,7 +1694,7 @@ class PoseToPoseUTFactor(Factor):
         # 检查全局缓存
         try:
             cache_key = _factor_cache_manager.get_spbp_cache_key(
-                "pose_to_pose", μx.tobytes(), Px.tobytes()
+                "pose_to_pose_bearing_range", μx.tobytes(), Px.tobytes()
             )
             cached_result = _factor_cache_manager.spbp_cache.get(cache_key)
             if cached_result is not None:
@@ -1673,11 +1707,11 @@ class PoseToPoseUTFactor(Factor):
             sigma_points, wm, wc = self.sigma_generator.generate(μx, Px)
             
             # 通过观测模型传播sigma点
-            Y = np.zeros((len(sigma_points), 3))
+            Y = np.zeros((len(sigma_points), 2))
             for i, point in enumerate(sigma_points):
                 Y[i] = self._observation_model(point)
             
-            # 计算预测观测均值（处理角度的圆周统计）
+            # 计算预测观测均值（处理方位的圆周统计）
             μy = self._compute_circular_mean(Y, wm)
             
             # 计算交叉协方差
@@ -1696,15 +1730,21 @@ class PoseToPoseUTFactor(Factor):
             
             # 转换为信息形式，使用安全的维度检查
             try:
-                Λ, η = safe_spbp_information_conversion(K, self.Rinv, residual, 6, 3)
+                Λ, η = safe_spbp_information_conversion(K, self.Rinv, residual, 6, 2)
             except ValueError as e:
                 logger.warning(f"SPBP information conversion failed: {e}, falling back to GBP")
-                return self._gbp_linearize(μx[:3], μx[3:], residual)
+                dx = μx[3] - μx[0]
+                dy = μx[4] - μx[1]
+                distance = math.hypot(dx, dy)
+                return self._gbp_linearize(μx[:3], μx[3:], residual, distance, dx, dy)
             
             # 提取块
             Λ1, Λ2 = Λ[:3, :3], Λ[3:, 3:]
             Λ12 = Λ[:3, 3:]
             η1, η2 = η[:3], η[3:]
+            
+            # 由于观测对 θ2 无贡献，需要正则化 Λ2
+            Λ2[2, 2] += numerical_config.min_eigenvalue
             
             result = {
                 self.pose1_key: (Λ1, η1),
@@ -1721,22 +1761,24 @@ class PoseToPoseUTFactor(Factor):
             
         except Exception as e:
             logger.warning(f"SPBP linearization failed: {e}, falling back to GBP")
-            return self._gbp_linearize(μx[:3], μx[3:], residual)
+            dx = μx[3] - μx[0]
+            dy = μx[4] - μx[1]
+            distance = math.hypot(dx, dy)
+            return self._gbp_linearize(μx[:3], μx[3:], residual, distance, dx, dy)
     
     def _compute_circular_mean(self, Y: np.ndarray, weights: np.ndarray) -> np.ndarray:
         """
-        计算观测均值，对角度使用圆周统计
+        计算观测均值，对方位使用圆周统计
         """
-        # 平移部分：标准线性均值
-        μy_dx = np.sum(weights * Y[:, 0])
-        μy_dy = np.sum(weights * Y[:, 1])
+        # 方位均值使用圆周统计
+        sin_sum = np.sum(weights * np.sin(Y[:, 0]))
+        cos_sum = np.sum(weights * np.cos(Y[:, 0]))
+        μy_bearing = math.atan2(sin_sum, cos_sum)
         
-        # 角度部分：圆周统计
-        sin_sum = np.sum(weights * np.sin(Y[:, 2]))
-        cos_sum = np.sum(weights * np.cos(Y[:, 2]))
-        μy_dtheta = math.atan2(sin_sum, cos_sum)
+        # 距离均值（标准线性）
+        μy_range = np.sum(weights * Y[:, 1])
         
-        return np.array([μy_dx, μy_dy, μy_dtheta])
+        return np.array([μy_bearing, μy_range])
     
     def _compute_cross_covariances(self, X: np.ndarray, Y: np.ndarray, 
                                    μx: np.ndarray, μy: np.ndarray, 
@@ -1753,13 +1795,12 @@ class PoseToPoseUTFactor(Factor):
         
         # 观测偏差
         dY = np.zeros_like(Y)
-        dY[:, 0] = Y[:, 0] - μy[0]       # dx差（线性）
-        dY[:, 1] = Y[:, 1] - μy[1]       # dy差（线性）
-        dY[:, 2] = wrap_angle(Y[:, 2] - μy[2])  # dθ差（圆周）
+        dY[:, 0] = wrap_angle(Y[:, 0] - μy[0])  # 方位差（圆周）
+        dY[:, 1] = Y[:, 1] - μy[1]              # 距离差（线性）
         
         # 计算协方差矩阵
-        Pxy = np.zeros((6, 3))
-        Pyy = np.zeros((3, 3))
+        Pxy = np.zeros((6, 2))
+        Pyy = np.zeros((2, 2))
         
         for i in range(n_points):
             Pxy += weights[i] * np.outer(dX[i], dY[i])
@@ -1778,7 +1819,7 @@ class PoseToPoseUTFactor(Factor):
             }
 
 # =====================================================================
-# Enhanced Loop Closure Factor
+# Loop Closure Factor
 # =====================================================================
 class LoopClosureFactor(Factor):
     """
@@ -1906,7 +1947,7 @@ class LoopClosureFactor(Factor):
         return 3 if key in (self.pose1_key, self.pose2_key) else 0
 
 # =====================================================================
-# Multi-Robot SLAM Utility Functions (Enhanced)
+# Multi-Robot SLAM Utility Functions
 # =====================================================================
 
 def create_multi_robot_odometry_chain(robot_id: int, num_poses: int, 
@@ -2086,7 +2127,9 @@ def create_pose_to_pose_ut_factors(robot1_id: int, robot2_id: int,
     Args:
         robot1_id: 观测机器人标识符
         robot2_id: 被观测机器人标识符
-        observations: (time1, time2, relative_pose, noise_covariance) 元组列表
+        observations: (time1, time2, measurement, noise_covariance) 元组列表
+        [Bearinng, Range] measurements
+        noise_covariance = 2x2
         validate_observations: 是否验证观测值
         **ut_params: UT参数 (mode, alpha, beta, kappa等)
         
@@ -2102,11 +2145,11 @@ def create_pose_to_pose_ut_factors(robot1_id: int, robot2_id: int,
                 logger.warning(f"Non-finite relative pose for times {time1}, {time2}, skipping")
                 continue
             
-            if relative_pose.size != 3:
+            if relative_pose.size != 2:
                 logger.warning(f"Invalid relative pose size for times {time1}, {time2}, skipping")
                 continue
             
-            if noise_cov.shape != (3, 3):
+            if noise_cov.shape != (2, 2):
                 logger.warning(f"Invalid noise covariance shape for times {time1}, {time2}, skipping")
                 continue
             
@@ -2141,7 +2184,7 @@ def create_mixed_inter_robot_factors(robot1_id: int, robot2_id: int,
         robot1_id: 第一个机器人标识符
         robot2_id: 第二个机器人标识符
         loop_closures: 环路闭合观测 (time1, time2, relative_pose, information_matrix)
-        pose_observations: 位姿观测 (time1, time2, relative_pose, noise_covariance)
+        pose_observations: 机器人间 bearing-range 观测 (time1, time2, measurement[2], noise_covariance 2x2)
         validate_observations: 是否验证观测值
         **ut_params: UT参数
         

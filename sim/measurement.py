@@ -58,7 +58,7 @@ def compute_bearing_range(observer_pose: np.ndarray,
     
     return local_bearing, range_val
 
-@dataclasses.dataclass
+@dataclasses.dataclass(kw_only=True)
 class MeasurementBase:
     """Base class for all measurements"""
     time: int
@@ -77,7 +77,7 @@ class MeasurementBase:
         """Return 2x2 noise covariance matrix"""
         return np.diag([self.noise_std_bearing**2, self.noise_std_range**2])
 
-@dataclasses.dataclass
+@dataclasses.dataclass(kw_only=True)
 class RobotLandmarkMeasurement(MeasurementBase):
     """Robot observing landmark measurement"""
     robot_id: int
@@ -96,7 +96,7 @@ class RobotLandmarkMeasurement(MeasurementBase):
             "noise_covariance": self.noise_covariance
         }
 
-@dataclasses.dataclass 
+@dataclasses.dataclass(kw_only=True)
 class InterRobotMeasurement(MeasurementBase):
     """Robot observing another robot measurement"""
     observer_robot_id: int
@@ -118,7 +118,7 @@ class InterRobotMeasurement(MeasurementBase):
             "noise_covariance": self.noise_covariance
         }
 
-@dataclasses.dataclass
+@dataclasses.dataclass(kw_only=True)
 class LoopClosureMeasurement:
     """Loop closure measurement between poses"""
     robot1_id: int
@@ -139,6 +139,72 @@ class LoopClosureMeasurement:
             "relative_pose": self.relative_pose.copy(),
             "information_matrix": self.information_matrix.copy()
         }
+class BearingRangeMeas:
+    """非dataclass实现的测量类"""
+    def __init__(self, robot=None, time=None, id=None, 
+                 bearing=None, range=None, **kwargs):
+        self.type = "robot_lm"
+        self.robot = robot
+        self.time = time
+        self.id = id
+        self.bearing = bearing
+        self.range = range
+        # --- 统一 bearing_range 表示 ---
+        if 'bearing_range' in kwargs and kwargs['bearing_range'] is not None:
+            # 若调用方直接传入 bearing_range（可能是 list / tuple / ndarray）
+            self.bearing_range = np.asarray(kwargs.pop('bearing_range'), dtype=float)
+        elif bearing is not None and range is not None:
+            # 根据单独的 bearing 与 range 拼
+            self.bearing_range = np.array([bearing, range], dtype=float)
+        else:
+            self.bearing_range = None
+        # ---------------------------------
+
+        # 其他可能的属性
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        仅返回 graph_build 解析所需字段，并把 ndarray → Python list，\
+        以免 JSON 序列化或 deepcopy 出错。
+        """
+        if self.type == "robot_lm":
+            base = {
+                "type": "robot_lm",
+                "robot": self.robot,
+                "time": self.time,
+                "id": self.id,
+            }
+        else:  # inter_robot
+            base = {
+                "type": "inter_robot",
+                "observer_robot": self.observer_robot,
+                "observer_time": self.observer_time,
+                "observed_robot": self.observed_robot,
+                "observed_time": self.observed_time,
+            }
+
+        # 公共测量字段
+        if self.bearing is not None:
+            base["bearing"] = float(self.bearing)
+        if self.range is not None:
+            base["range"] = float(self.range)
+        if self.bearing_range is not None:
+            base["bearing_range"] = (
+                self.bearing_range.tolist()
+                if hasattr(self.bearing_range, "tolist")
+                else list(self.bearing_range)
+            )
+        if hasattr(self, "noise_covariance") and self.noise_covariance is not None:
+            base["noise_covariance"] = self.noise_covariance.tolist()
+
+        return base
+
+def make_meas(**kwargs) -> "BearingRangeMeas":
+    """兼容旧调用：make_meas(robot=..., time=..., ...)"""
+    return BearingRangeMeas(**kwargs)
+
 
 class MeasurementGenerator:
     """
@@ -289,16 +355,21 @@ class MeasurementGenerator:
                         bearing, range_val = self._add_measurement_noise(bearing, range_val)
                     
                     # Create measurement
-                    measurement = RobotLandmarkMeasurement(
+                    bearing_std = self.config["bearing_noise_std"]
+                    range_std = self._get_range_noise_std(range_val)
+                    noise_covariance = np.diag([bearing_std**2, range_std**2])
+
+                    # 使用make_meas创建兼容对象
+                    measurement = make_meas(
+                        robot=robot_id,
                         time=time_step,
+                        id=landmark_id,
                         bearing=bearing,
                         range=range_val,
-                        robot_id=robot_id,
-                        landmark_id=landmark_id,
-                        noise_std_bearing=self.config["bearing_noise_std"],
-                        noise_std_range=self._get_range_noise_std(range_val)
+                        bearing_range=[bearing, range_val],
+                        noise_covariance=noise_covariance
                     )
-                    
+
                     measurements.append(measurement.to_dict())
         
         return measurements
@@ -341,18 +412,22 @@ class MeasurementGenerator:
                         bearing, range_val = self._add_measurement_noise(bearing, range_val)
                     
                     # Create measurement
-                    measurement = InterRobotMeasurement(
-                        time=time_step,
-                        bearing=bearing,
-                        range=range_val,
-                        observer_robot_id=observer_id,
-                        observed_robot_id=observed_id,
+                    bearing_std = self.config["bearing_noise_std"]
+                    range_std = self._get_range_noise_std(range_val)
+                    noise_covariance = np.diag([bearing_std**2, range_std**2])
+                    
+                    measurement = make_meas(
+                        type="inter_robot",  
+                        observer_robot=observer_id,
+                        observed_robot=observed_id,
                         observer_time=time_step,
                         observed_time=time_step,
-                        noise_std_bearing=self.config["bearing_noise_std"],
-                        noise_std_range=self._get_range_noise_std(range_val)
+                        bearing=bearing,
+                        range=range_val,
+                        bearing_range=np.array([bearing, range_val], dtype=np.float64),
+                        noise_covariance=noise_covariance,
                     )
-                    
+
                     measurements.append(measurement.to_dict())
         
         return measurements
@@ -583,6 +658,7 @@ def generate_noisy_measurements(true_measurements: List[Dict],
     
     return noisy_measurements
 
+
 # Export main classes and functions
 __all__ = [
     'MeasurementGenerator', 
@@ -593,5 +669,7 @@ __all__ = [
     'generate_multi_robot_measurements', 
     'generate_noisy_measurements',
     'compute_bearing_range',
-    'wrap_angle'
+    'wrap_angle',
+    'BearingRangeMeas',
+    'make_meas',
 ]

@@ -100,8 +100,8 @@ class GBPGraphBuilder:
         
         # ✅ 新增：PoseToPoseUTFactor 参数
         "inter_robot_obs_mode": "auto",
-        "inter_robot_obs_sigma_xy": 0.15,
-        "inter_robot_obs_sigma_theta": 0.03,
+        "inter_robot_obs_sigma_bearing": math.radians(2.5),  # rad
+        "inter_robot_obs_sigma_range": 0.15,                 # m
         "p2p_distance_threshold": 8.0,
         "p2p_residual_threshold": 2.0,
         
@@ -185,6 +185,13 @@ class GBPGraphBuilder:
         self._landmarks = None
         self.robot_paths = None
         self._build_start_time = None
+        
+        legacy_xy = self.cfg.pop("inter_robot_obs_sigma_xy", None)
+        legacy_th = self.cfg.pop("inter_robot_obs_sigma_theta", None)
+        if legacy_xy is not None:
+            self.cfg.setdefault("inter_robot_obs_sigma_range",  legacy_xy)
+        if legacy_th is not None:
+            self.cfg.setdefault("inter_robot_obs_sigma_bearing", legacy_th)
 
     def build(self, robot_paths: Union[np.ndarray, List[np.ndarray]], 
               landmark_pos: np.ndarray, 
@@ -286,7 +293,8 @@ class GBPGraphBuilder:
         
         logger.info("Added %d valid inter-robot observation factors", valid_count)
         self.stats.inter_robot_factors = valid_count
-    
+        
+
     def _add_single_inter_robot_observation(self, obs: Dict[str, Any]) -> bool:
         """添加单个机器人间观测因子"""
         # 提取参数
@@ -294,10 +302,21 @@ class GBPGraphBuilder:
         observer_time = obs.get("observer_time", obs.get("time1"))
         observed_robot = obs.get("observed_robot", obs.get("robot2"))
         observed_time = obs.get("observed_time", obs.get("time2"))
-        relative_pose = obs.get("relative_pose")
-        
+        # ---- measurement vector: [bearing, range] ----
+        meas_vec = None
+        if "bearing_range" in obs and obs["bearing_range"] is not None:
+            meas_vec = np.asarray(obs["bearing_range"], dtype=float)
+        elif "measurement" in obs and obs["measurement"] is not None:   # 兼容别名
+            meas_vec = np.asarray(obs["measurement"], dtype=float)
+        else:
+            return False          # 没找到合法 2-DoF 观测
+
+        # 保证正好 2 维
+        if meas_vec.size != 2:
+            return False
+                
         # 验证参数
-        if None in [observer_robot, observer_time, observed_robot, observed_time, relative_pose]:
+        if None in [observer_robot, observer_time, observed_robot, observed_time]:
             return False
         
         # 验证范围
@@ -332,7 +351,7 @@ class GBPGraphBuilder:
         factor = PoseToPoseUTFactor(
             observer_key,
             observed_key,
-            np.array(relative_pose, dtype=np.float64),
+            meas_vec.astype(np.float64),
             noise_cov,
             mode=self.cfg["inter_robot_obs_mode"],
             alpha=self.cfg["ut_alpha"],
@@ -611,21 +630,18 @@ class GBPGraphBuilder:
             self._local_cache["noise_matrices"][cache_key] = R.copy()
         
         return R
-
+    # -------------------------------------------------------------------------
     def _get_inter_robot_noise_matrix(self) -> np.ndarray:
-        """获取机器人间观测噪声矩阵"""
-        cache_key = "inter_robot_noise"
-        
+        cache_key = "inter_robot_noise_2dof"
         if cache_key not in self._local_cache["noise_matrices"]:
-            sigma_xy = self.cfg["inter_robot_obs_sigma_xy"]
-            sigma_theta = self.cfg["inter_robot_obs_sigma_theta"]
-            
-            cov = np.diag([sigma_xy**2, sigma_xy**2, sigma_theta**2])
+            sigma_b = self.cfg["inter_robot_obs_sigma_bearing"]
+            sigma_r = self.cfg["inter_robot_obs_sigma_range"]
+
+            cov = np.diag([sigma_b ** 2, sigma_r ** 2])
             cov = ensure_positive_definite(cov, numerical_config.regularization)
-            
             self._local_cache["noise_matrices"][cache_key] = cov
-        
         return self._local_cache["noise_matrices"][cache_key].copy()
+
 
     def _get_prior_sigma(self) -> np.ndarray:
         """获取先验约束标准差"""
@@ -690,9 +706,12 @@ class GBPGraphBuilder:
     def _validate_numerical_ranges(self):
         """验证数值参数范围"""
         positive_params = [
-            "max_obs_range", "min_obs_range", "obs_sigma_bearing", "obs_sigma_range",
-            "prior_sigma_xy", "prior_sigma_theta", "odom_sigma_xy", "odom_sigma_theta",
-            "inter_robot_obs_sigma_xy", "inter_robot_obs_sigma_theta"
+            "max_obs_range", "min_obs_range",
+            "obs_sigma_bearing", "obs_sigma_range",
+            "prior_sigma_xy", "prior_sigma_theta",
+            "odom_sigma_xy", "odom_sigma_theta",
+            "inter_robot_obs_sigma_bearing",   # ✅ 新字段
+            "inter_robot_obs_sigma_range"      # ✅ 新字段
         ]
         
         for param in positive_params:
