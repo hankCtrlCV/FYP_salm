@@ -114,7 +114,7 @@ class GBPGraphBuilder:
         "enable_visibility_check": True,
         "add_anchor": True,
         "anchor_strategy": "landmarks",  # "landmarks", "poses", "mixed"
-        "enable_loop_closure": False,
+        "enable_loop_closure": True,
         "loop_closure_threshold": 1.0,
         
         # ✅ 新增：多机器人特性开关
@@ -1045,7 +1045,8 @@ class GBPGraphBuilder:
                 relative_pose = closure.get("relative_pose")
                 information = closure.get("information_matrix")
                 
-                if None in [robot1_id, time1, robot2_id, time2, relative_pose]:
+                # if None in [robot1_id, time1, robot2_id, time2, relative_pose]:
+                if any(x is None for x in (robot1_id, time1, robot2_id, time2, relative_pose)):
                     continue
                 
                 pose1_key = f"x{robot1_id}_{time1}"

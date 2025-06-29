@@ -153,6 +153,14 @@ def create_slam_animation(tra, lms, meas, factors, variables,
     odom_lc = LineCollection([], colors="k", lw=.8, alpha=.3); ax.add_collection(odom_lc)
     obs_lc  = LineCollection([], colors="green", ls="--", lw=.5, alpha=.3); ax.add_collection(obs_lc)
     ir_lc   = LineCollection([], colors="red",   ls="--", lw=1.5, alpha=.4); ax.add_collection(ir_lc)
+    
+    odom_lc.set_label("Odometry")
+    obs_lc.set_label("Obs")
+    ir_lc.set_label("Inter-Robot")
+    
+    handles = [odom_lc, obs_lc, ir_lc, *robot_plots]
+    ax.legend(handles=handles, loc="best")
+
 
     txt_t  = ax.text(.02,.98,"", transform=ax.transAxes, va="top", fontsize=12)
     txt_st = ax.text(.02,.94,"", transform=ax.transAxes, va="top", fontsize=10)
@@ -217,7 +225,7 @@ def create_slam_animation(tra, lms, meas, factors, variables,
 
     ani = animation.FuncAnimation(fig, update, frames=T+10, interval=1000/fps, blit=False)
     plt.show()
-    plt.legend(); plt.tight_layout()
+    plt.tight_layout()
     return ani, fig
 # ============================  主流程  =========================================
 def run_factor_graph_test() -> bool:
@@ -239,9 +247,9 @@ def run_factor_graph_test() -> bool:
             "landmark_detection_prob": 1.0,
             "robot_detection_prob":    1.0,
             "enable_inter_robot_measurements": True,
-            "enable_loop_closure": False,
+            "enable_loop_closure": True,
         }
-        measurements, _ = generate_multi_robot_measurements(tra, lms, meas_cfg)
+        measurements, loop_closures= generate_multi_robot_measurements(tra, lms, meas_cfg)
         lm_meas = [m for m in measurements if m["type"]=="robot_lm"]
         ir_meas = [m for m in measurements if m["type"]=="inter_robot"]
         logger.info("  -> %d landmark obs, %d inter-robot obs",
@@ -249,7 +257,7 @@ def run_factor_graph_test() -> bool:
 
         # 3. 构建图 ---------------------------------------------------------------
         builder = GBPGraphBuilder(BuilderConfig().to_dict())
-        factors, variables = builder.build(tra, lms, lm_meas, inter_robot_obs=ir_meas)
+        factors, variables = builder.build(tra, lms, lm_meas, inter_robot_obs=ir_meas, loop_closures=loop_closures)
         logger.info("  -> graph: %d factors / %d variables", len(factors), len(variables))
 
         # 4. 可视化 ---------------------------------------------------------------
