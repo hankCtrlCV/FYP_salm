@@ -1,0 +1,17 @@
+# configs/slam_gbp.yaml
+ut:                # 只对 GBP 有意义
+  ut_mode:          "auto"
+  ut_alpha:         0.1
+  ut_beta:          2.0
+  ut_kappa:         0.0
+  ut_linear_threshold:    4.0
+  ut_residual_threshold:  2.5
+  numerical_config:
+    regularization:        1.0e-12
+    max_condition_number:  1.0e8
+
+
+performance:
+  enable_vectorization:   true
+  enable_batch_processing: true
+  enable_factor_reordering: true

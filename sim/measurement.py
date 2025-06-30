@@ -1,5 +1,5 @@
 """
-Enhanced Measurement Generation for Multi-Robot SLAM
+Measurement Generation for Multi-Robot SLAM
 - Consistent with factor_ut.py and graph_build.py interfaces
 - Proper coordinate frame handling
 - Support for both centralized and distributed scenarios
@@ -11,10 +11,27 @@ Date: 2025-06-18
 import numpy as np
 import math
 from typing import List, Dict, Tuple, Any, Optional, Union
+from utils.cfg_loader import load_common  
 import dataclasses
 import logging
 
 logger = logging.getLogger("MeasurementGen")
+
+# =====================================================================
+# yaml loader Functions
+# =====================================================================
+def _flatten_yaml(d: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    把多层 YAML 打平成 {leaf_key: value}，忽略中间层名字。
+    e.g. {'noise': {'obs_sigma_bearing': 0.05}}  ➜  {'obs_sigma_bearing': 0.05}
+    """
+    flat = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            flat.update(_flatten_yaml(v))     # 递归但不带前缀
+        else:
+            flat[k] = v
+    return flat
 
 # Constants
 _EPSILON = 1e-9
@@ -218,44 +235,57 @@ class MeasurementGenerator:
         Args:
             config: Configuration dictionary
         """
-        default_config = {
-            # Noise parameters
-            "bearing_noise_std": math.radians(2.0),
-            "range_noise_std": 0.15,
-            
-            # Observation limits
-            "max_landmark_range": 25.0,
-            "min_landmark_range": 0.5,
-            "max_robot_range": 20.0,
-            "min_robot_range": 1.0,
-            
-            # Detection probabilities
-            "landmark_detection_prob": 0.8,
-            "robot_detection_prob": 0.6,
-            
-            # Field of view (full circle = 2π)
-            "landmark_fov": _TWO_PI,
-            "robot_fov": _TWO_PI,
-            
-            # Loop closure detection
-            "enable_loop_closure": True,
-            "loop_closure_distance_threshold": 2.0,
-            "loop_closure_time_threshold": 10,
-            
-            # Noise options
+        
+        # ② 读取并打平 yaml
+        yaml_cfg = _flatten_yaml(load_common())
+
+        # ③ 根据 yaml 填充 Measurement 需要的字段；若 yaml 没提供则退回旧缺省
+        default_cfg = {
+            # ---- 噪声 ----
+            "bearing_noise_std": yaml_cfg.get(
+                "bearing_noise_std",
+                yaml_cfg.get("obs_sigma_bearing", math.radians(2.0))),
+            "range_noise_std": yaml_cfg.get(
+                "range_noise_std",
+                yaml_cfg.get("obs_sigma_range", 0.15)),
+
+            # ---- 可见距离/角度 ----
+            "max_landmark_range": yaml_cfg.get("max_landmark_range", 25.0),
+            "min_landmark_range": yaml_cfg.get("min_landmark_range", 0.5),
+            "max_robot_range":    yaml_cfg.get("max_robot_range",    20.0),
+            "min_robot_range":    yaml_cfg.get("min_robot_range",    1.0),
+            "landmark_fov":       yaml_cfg.get("landmark_fov",
+                                               yaml_cfg.get("max_obs_angle", _TWO_PI)),
+            "robot_fov":          yaml_cfg.get("robot_fov",
+                                               yaml_cfg.get("max_obs_angle", _TWO_PI)),
+
+            # ---- 探测概率 ----
+            "landmark_detection_prob":
+                yaml_cfg.get("landmark_detection_prob", 0.8),
+            "robot_detection_prob":
+                yaml_cfg.get("robot_detection_prob", 0.6),
+
+            # ---- Loop-closure 阈值 ----
+            "enable_loop_closure":
+                yaml_cfg.get("enable_loop_closure", True),
+            "loop_closure_distance_threshold":
+                yaml_cfg.get("loop_closure_distance_threshold", 2.0),
+            "loop_closure_time_threshold":
+                yaml_cfg.get("loop_closure_time_threshold", 10),
+
+            # ---- 旧版保持 ----
             "add_noise": True,
             "adaptive_noise": False,
             "range_dependent_noise": False,
-            
-            # Multi-robot options
             "enable_inter_robot_measurements": True,
             "synchronous_observations": True,
-            
-            # Random seed
-            "random_seed": 42
+            "random_seed": 42,
         }
-        
-        self.config = {**default_config, **(config or {})}
+
+        # ④ 三层覆盖：`default_cfg` < `yaml_cfg` < 外部 `config`
+        #    （yaml 已经被打平，但我们只取 Measurement 关心的键）
+        merged_from_yaml = {k: yaml_cfg[k] for k in default_cfg.keys() if k in yaml_cfg}
+        self.config = {**default_cfg, **merged_from_yaml, **(config or {})}
         self.rng = np.random.default_rng(self.config["random_seed"])
         
         # Statistics

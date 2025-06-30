@@ -1,0 +1,41 @@
+# configs/slam_common.yaml   
+noise:
+  # ------- Builder / Measurement 共用 -------
+  prior_sigma_xy:      0.05
+  prior_sigma_theta:   0.02
+  odom_sigma_xy:       0.08
+  odom_sigma_theta:    0.015
+  obs_sigma_bearing:   0.0523599     # ≈3°
+  obs_sigma_range:     0.12
+  # ------- MeasurementGenerator 专用别名 -------
+  bearing_noise_std:   0.0523599     
+  range_noise_std:     0.12
+  # ------- Inter-robot / Loop closure -------
+  inter_robot_obs_sigma_bearing: 0.0436332   # ≈2.5°
+  inter_robot_obs_sigma_range:   0.15
+  loop_closure_sigma_xy:      0.16
+  loop_closure_sigma_theta:   0.03
+
+obs:
+  # ---- Landmark / robot 可视距离 ----
+  max_landmark_range:  20.0     # 给 Measurement
+  min_landmark_range:  0.1
+  max_robot_range:     20.0
+  min_robot_range:     1.0
+  # ---- 可视角 ----
+  max_obs_angle:       3.14159  # π，全向
+  landmark_fov:        3.14159  # 同上，若分离
+  robot_fov:           3.14159
+  max_obs_range: 20.0   
+  min_obs_range: 0.1    
+
+anchor:
+  add_anchor:      true
+  anchor_strategy: "landmarks"   # landmarks / poses / mixed
+
+measurement:
+  landmark_detection_prob: 1.0
+  robot_detection_prob:    1.0
+  loop_closure_distance_threshold: 2.0   # ≤ measurement.default_config
+  loop_closure_time_threshold:     10
+  enable_loop_closure:     true      # 若想统一开关

@@ -49,6 +49,24 @@ from algorithm.frontend.factor_ut import (
 
 logger = logging.getLogger("GBPBuilder")
 
+#------------------------------------------------------
+# 辅助函数：将多层 YAML 字典打平为一层
+def _flatten_yaml(d: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    把多层 YAML dict 打平成一层 **并丢掉中间层名字**，
+    {'noise': {'obs_sigma_range':0.1}} → {'obs_sigma_range':0.1}
+    若同名键冲突，后出现者覆盖先出现者（常见用法）。
+    """
+    flat = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            flat.update(_flatten_yaml(v))      # 递归但不拼前缀
+        else:
+            flat[k] = v
+    return flat
+
+
+
 @dataclass
 class GraphBuildStats:
     """图构建统计信息"""
@@ -154,7 +172,16 @@ class GBPGraphBuilder:
         Args:
             cfg: 配置字典，用于覆盖默认设置
         """
-        self.cfg = {**self._DEFAULT_CONFIG, **(cfg or {})}
+        # ① 读取并扁平化 YAML
+        _yaml_cfg_flat = _flatten_yaml(load_gbp())
+
+        # ② 只拣 _DEFAULT_CONFIG 里关心的键覆写
+        yaml_overrides = {k: _yaml_cfg_flat[k] 
+                        for k in self._DEFAULT_CONFIG.keys() if k in _yaml_cfg_flat}
+
+        # ③ 三层覆盖：默认 < YAML < 外部 cfg
+        self.cfg = {**self._DEFAULT_CONFIG, **yaml_overrides, **(cfg or {})}
+
         self._validate_config()
         
         # ✅ 配置全局数值参数
@@ -1372,3 +1399,4 @@ __all__ = [
     'create_single_robot_graph', 'create_multi_robot_graph', 'create_high_performance_graph',
     'PerformanceMonitor'
 ]
+
