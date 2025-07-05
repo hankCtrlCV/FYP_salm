@@ -62,30 +62,26 @@ def info_to_gaussian(L: np.ndarray, eta: np.ndarray) -> Tuple[np.ndarray, np.nda
     μ = Σ @ eta
     return μ, Σ
 
+
 def _clip_pair(L: np.ndarray, eta: np.ndarray,
                s_max_lim: float = _CLIP_SV) -> Tuple[np.ndarray, np.ndarray]:
-    """Clip information matrix and vector to prevent numerical overflow.
-    
-    Mathematical principle: If L' = s*L, then to keep μ = L^(-1)*η unchanged,
-    we need η' = s²*η, since μ = (s*L)^(-1)*(s²*η) = (1/s)*L^(-1)*(s²*η) = s*L^(-1)*η.
+    """
+    If the greatest singular value of L exceeds s_max_lim, uniformly scale
+    (L, η) so that the new max-SV equals s_max_lim while keeping μ unchanged.
+    Since μ = L⁻¹η, scaling both by the same factor keeps μ invariant.
     """
     if L.size == 0:
         return L, eta
-    
-    # Check condition number instead of just max singular value
+
     try:
-        s = np.linalg.svd(L, compute_uv=False)
-        s_max, s_min = s.max(), s[s > _EPS].min() if np.any(s > _EPS) else _EPS
-        cond = s_max / s_min
-        
-        if cond > s_max_lim:
-            scale = np.sqrt(s_max_lim / cond)
-            # Scale precision by s, information vector by s² to keep μ unchanged
-            return L * scale, eta * (scale * scale)
-    except:
+        s_max = np.linalg.svd(L, compute_uv=False).max()
+        if s_max > s_max_lim:
+            scale = s_max_lim / s_max          # 直接压缩到阈值
+            return L * scale, eta * scale      # 同一次幂保持 μ 不变
+    except Exception:      # SVD 失败直接跳过
         pass
-    
     return L, eta
+
 
 def safe_subtract_info(L1: np.ndarray, eta1: np.ndarray, 
                       L2: np.ndarray, eta2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -202,7 +198,8 @@ class VarNode:
                 if 0 <= idx < self.dim:
                     # Use angular difference for proper angle updates
                     angle_diff_val = angle_diff(mu_new[idx], self.mu[idx])
-                    mu_new[idx] = wrap_angle(self.mu[idx] + self.damp * angle_diff_val)
+                    mu_new[idx] = wrap_angle(self.mu[idx] + angle_diff_val)
+
         
         # Compute convergence metric
         delta = float(np.linalg.norm(mu_new - self.mu))
@@ -224,6 +221,10 @@ class FacNode:
         self.vars = [k for k in vkeys if factor._get_dim(k) > 0]
         self.prev_msg = {k: (np.zeros((factor._get_dim(k), factor._get_dim(k))),
                              np.zeros(factor._get_dim(k))) for k in self.vars}
+        self.robot_set = {  # 记录与此因子相连的所有机器人 ID
+            int(v.split('_')[0][1:])            # 从 'x0_3' 提取 0
+            for v in self.vars if v.startswith('x')
+        }
 
     def reset(self):
         """Reset all previous messages."""
@@ -237,6 +238,7 @@ class GBPGraph:
                  priors: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
                  angle_vars: Optional[Dict[str, List[int]]] = None,
                  bel_damp: float = _DAMP_BEL, msg_damp: float = _DAMP_MSG):
+        
         self.d_bel, self.d_msg = float(bel_damp), float(msg_damp)
         
         # Variable nodes
@@ -260,7 +262,38 @@ class GBPGraph:
         self.m_v2f: Dict[Tuple[str, int], Tuple[np.ndarray, np.ndarray]] = {}
         self.m_f2v: Dict[Tuple[int, str], Tuple[np.ndarray, np.ndarray]] = {}
         self.max_delta_history: List[float] = []
+        
+        #communication statistics
+        self.comm_bytes = 0
+        self.robot_vars = self._identify_robot_variables()
 
+    def _identify_robot_variables(self) -> Dict[str, int]:
+        """识别每个变量属于哪个机器人"""
+        robot_vars = {}
+        for var_name in self.v:
+            robot_id = self._get_robot_id(var_name)
+            if robot_id is not None:
+                robot_vars[var_name] = robot_id
+        return robot_vars
+
+    def _get_robot_id(self, var_name: str) -> Optional[int]:
+        """从变量名提取机器人ID"""
+        if var_name.startswith('x'):
+            parts = var_name.split('_')
+            if len(parts) >= 2:
+                # 格式如 'x0_1' 表示机器人0的第1个位姿
+                try:
+                    return int(parts[0][1:])  # 提取'x'后的数字
+                except ValueError:
+                    pass
+        return None
+
+    
+    def _is_cross_robot(self, var_name: str, fn: FacNode) -> bool:
+        if var_name not in self.robot_vars:           # 变量未归属任何机器人
+            return False
+        return self.robot_vars[var_name] not in fn.robot_set
+    
     def _sweep(self) -> float:
         """One complete GBP iteration."""
         
@@ -269,6 +302,7 @@ class GBPGraph:
             L_belief, eta_belief = vn.belief()
             
             for fid in vn.fids:
+                fn_obj = self.f[fid]
                 # Get previous F→V message
                 L_f2v, eta_f2v = self.m_f2v.get((fid, k), 
                                                 (np.zeros((vn.dim, vn.dim)),
@@ -289,6 +323,13 @@ class GBPGraph:
                 L_msg, eta_msg = _clip_pair(L_msg, eta_msg)
                 
                 self.m_v2f[(k, fid)] = (L_msg, eta_msg)
+                
+                if self._is_cross_robot(k, fn_obj): 
+                    # 对称信息矩阵只需传递上/下三角+信息向量
+                    # 每个浮点数8字节
+                    matrix_elements = vn.dim * (vn.dim + 1) // 2  # 上三角元素数量
+                    vector_elements = vn.dim                      # 向量元素数量
+                    self.comm_bytes += 8 * (matrix_elements + vector_elements)
 
         # 2) Factor to Variable messages  
         for fn in self.f:
@@ -369,6 +410,12 @@ class GBPGraph:
                 # Clip and store
                 Lkk, ηk = _clip_pair(Lkk, ηk)
                 self.m_f2v[(fn.id, tgt)] = (Lkk, ηk)
+                
+                if self._is_cross_robot(tgt, fn): 
+                    dim = self.v[tgt].dim
+                    matrix_elements = dim * (dim + 1) // 2
+                    vector_elements = dim
+                    self.comm_bytes += 8 * (matrix_elements + vector_elements)
 
         # 3) Belief updates
         max_delta = 0.0
@@ -395,7 +442,8 @@ class GBPGraph:
         return max_delta
 
     def run(self, max_iter: int = 100, tol: float = 1e-5, 
-            verbose: bool = True) -> List[float]:
+            verbose: bool = True) -> Tuple[List[float], Dict[str, Any]]:
+            
         """Run GBP until convergence."""
         
         # Reset state
@@ -404,6 +452,7 @@ class GBPGraph:
         for fn in self.f:
             fn.reset()
         self.max_delta_history.clear()
+        self.comm_bytes = 0
         
         if verbose:
             _log.info(f"Starting GBP with {len(self.v)} variables, {len(self.f)} factors")
@@ -428,7 +477,13 @@ class GBPGraph:
             if verbose:
                 _log.warning(f"Reached max iterations ({max_iter}) without full convergence")
         
-        return self.max_delta_history
+        stats = {
+            "iterations": len(self.max_delta_history),
+            "converged": len(self.max_delta_history) > 0 and self.max_delta_history[-1] < tol,
+            "comm_bytes": self.comm_bytes,
+            "final_delta": self.max_delta_history[-1] if self.max_delta_history else float('inf')
+        }
+        return self.max_delta_history, stats
     
     # Backward compatibility alias
     def solve(self, *args, **kwargs):
@@ -485,3 +540,11 @@ class GBPGraph:
     def get_convergence_history(self) -> List[float]:
         """Get convergence history (max delta per iteration)."""
         return self.max_delta_history.copy()
+    
+    def get_comm_bytes(self) -> int:
+        """获取累计通信字节数"""
+        return self.comm_bytes
+
+    def reset_comm_stats(self):
+        """重置通信统计"""
+        self.comm_bytes = 0

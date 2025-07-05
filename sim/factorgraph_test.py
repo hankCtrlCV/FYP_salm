@@ -29,7 +29,7 @@ logger = logging.getLogger("SLAMAnimation")
 # ---------- 外部模块 ----------
 from sim.world              import create_multi_robot_world, validate_world_consistency
 from sim.measurement        import generate_multi_robot_measurements           
-from sim.graph_build        import GBPGraphBuilder
+from algorithm.frontend.graph_build        import GBPGraphBuilder
 from algorithm.frontend.factor_ut import (wrap_angle, PriorFactor, OdometryFactor, BearingRangeUTFactor, PoseToPoseUTFactor, LoopClosureFactor
 )
 

@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 # Constants and Configuration
 # =====================================================================
-_EPS = 1e-14                    # Machine epsilon 
+_EPS = 1e-8                    # Machine epsilon 
 _SMALL_NUMBER = 1e-12           # 数值稳定性参数
 _ANGLE_WRAP_TOLERANCE = 1e-12   # 角度包装容差
 _MAX_CONDITION_NUMBER = 1e8     # 矩阵条件数限制 
@@ -331,6 +331,9 @@ def safe_matrix_inverse(matrix: np.ndarray,
             # 最后的回退：正则化的伪逆
             return np.linalg.pinv(matrix, rcond=regularization)
 
+# =====================================================================
+# clip_jacobian 提前跳过
+# =====================================================================
 def clip_jacobian(jacobian: np.ndarray, threshold: float = None) -> np.ndarray:
     """
     裁剪雅可比矩阵防止数值爆炸
@@ -345,12 +348,15 @@ def clip_jacobian(jacobian: np.ndarray, threshold: float = None) -> np.ndarray:
     if threshold is None:
         threshold = numerical_config.jacobian_clip_threshold
     
+    # 提前跳过：如果已经在阈值内，避免不必要的拷贝
+    if np.max(np.abs(jacobian)) <= threshold:
+        return jacobian
+    
     clipped = np.clip(jacobian, -threshold, threshold)
     
-    # 记录是否进行了裁剪
-    if not np.array_equal(jacobian, clipped):
-        max_val = np.max(np.abs(jacobian))
-        logger.debug(f"Jacobian clipped: max value was {max_val:.2e}")
+    # 记录裁剪信息
+    max_val = np.max(np.abs(jacobian))
+    logger.debug(f"Jacobian clipped: max value was {max_val:.2e}")
     
     return clipped
 
@@ -2285,6 +2291,7 @@ def validate_spbp_dimensions(K: np.ndarray, Rinv: np.ndarray, residual: np.ndarr
     except Exception as e:
         raise ValueError(f"SPBP dimension validation failed: {e}")
 
+
 def safe_spbp_information_conversion(K: np.ndarray, Rinv: np.ndarray, residual: np.ndarray,
                                    state_dim: int, obs_dim: int) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -2327,6 +2334,12 @@ def safe_spbp_information_conversion(K: np.ndarray, Rinv: np.ndarray, residual: 
     except Exception as e:
         logger.error(f"SPBP information conversion failed: {e}")
         raise
+
+# =====================================================================
+# validate_factor_graph 函数
+# =====================================================================
+def validate_factor_graph(factors: List[Factor],
+                          variables: Dict[str, int]) -> bool:
     """
     验证因子图的一致性
     
@@ -2354,6 +2367,30 @@ def safe_spbp_information_conversion(K: np.ndarray, Rinv: np.ndarray, residual: 
     except Exception as e:
         logger.error(f"Factor graph validation failed: {e}")
         return False
+
+# =====================================================================
+# test_spbp_dimension_fix 函数
+# =====================================================================
+def test_spbp_dimension_fix():
+    """
+    单元自测：验证 _spbp_information_conversion 的维度检查不会再触发
+    "K @ Rinv @ K.T 与 K.T @ Rinv @ K" 的旧 bug。
+    """
+    nx, nz = 5, 2
+    K = np.random.randn(nx, nz)
+    R = np.eye(nz) * 0.1
+    Rinv = np.linalg.inv(R)
+    residual = np.random.randn(nz)
+
+    try:
+        Λ, η = safe_spbp_information_conversion(K, Rinv, residual, nx, nz)
+        assert Λ.shape == (nx, nx) and η.shape == (nx,)
+        logger.info("SPBP dimension self-test passed")
+        return True
+    except Exception as e:
+        logger.error(f"SPBP dimension self-test failed: {e}")
+        return False
+
 
 # =====================================================================
 # Main Export List  

@@ -3,16 +3,8 @@ Enhanced GBP Factor Graph Builder for Multi-Robot SLAM
 Fully compatible with factor_ut.py v2.3 and optimized for performance
 
 Author: Enhanced for Multi-Robot SLAM  
-Date: 2025-06-21
-Version: 2.0 - Major Update:
-- Full integration with factor_ut.py v2.3
-- Added PoseToPoseUTFactor support for inter-robot observations
-- Eliminated code duplication by reusing factor_ut implementations
-- Integrated numerical_config system for improved stability
-- Coordinated cache management with global factor cache system
-- Implemented true vectorization and batch processing
-- Enhanced validation and error handling
-- Performance optimizations and monitoring
+Date: 2025-07-04
+Version: 2.1 - Fixed 8 critical issues identified in static analysis
 """
 
 from __future__ import annotations
@@ -24,7 +16,14 @@ from collections import defaultdict, Counter
 import warnings
 import time
 from dataclasses import dataclass
-from utils.cfg_loader import load_gbp
+
+# ✅ 修复1: Import fallback处理
+try:
+    from utils.cfg_loader import load_gbp
+except ImportError:
+    def load_gbp():
+        """Fallback implementation when utils.cfg_loader is not available"""
+        return {}
 
 from algorithm.frontend.factor_ut import (
     # Core factor classes
@@ -50,8 +49,8 @@ from algorithm.frontend.factor_ut import (
 logger = logging.getLogger("GBPBuilder")
 
 #------------------------------------------------------
-# 辅助函数：将多层 YAML 字典打平为一层
-def _flatten_yaml(d: Dict[str, Any]) -> Dict[str, Any]:
+# ✅ 修复2: _flatten_yaml 增加覆盖提示
+def _flatten_yaml(d: Dict[str, Any], verbose: bool = False) -> Dict[str, Any]:
     """
     把多层 YAML dict 打平成一层 **并丢掉中间层名字**，
     {'noise': {'obs_sigma_range':0.1}} → {'obs_sigma_range':0.1}
@@ -60,12 +59,16 @@ def _flatten_yaml(d: Dict[str, Any]) -> Dict[str, Any]:
     flat = {}
     for k, v in d.items():
         if isinstance(v, dict):
-            flat.update(_flatten_yaml(v))      # 递归但不拼前缀
+            nested_flat = _flatten_yaml(v, verbose)
+            for nested_key, nested_val in nested_flat.items():
+                if verbose and nested_key in flat:
+                    logger.info(f"YAML config override: {nested_key} = {nested_val} (was {flat[nested_key]})")
+                flat[nested_key] = nested_val
         else:
+            if verbose and k in flat:
+                logger.info(f"YAML config override: {k} = {v} (was {flat[k]})")
             flat[k] = v
     return flat
-
-
 
 @dataclass
 class GraphBuildStats:
@@ -172,8 +175,8 @@ class GBPGraphBuilder:
         Args:
             cfg: 配置字典，用于覆盖默认设置
         """
-        # ① 读取并扁平化 YAML
-        _yaml_cfg_flat = _flatten_yaml(load_gbp())
+        # ① 读取并扁平化 YAML，✅ 修复2: 启用verbose
+        _yaml_cfg_flat = _flatten_yaml(load_gbp(), verbose=True)
 
         # ② 只拣 _DEFAULT_CONFIG 里关心的键覆写
         yaml_overrides = {k: _yaml_cfg_flat[k] 
@@ -213,12 +216,21 @@ class GBPGraphBuilder:
         self.robot_paths = None
         self._build_start_time = None
         
-        legacy_xy = self.cfg.pop("inter_robot_obs_sigma_xy", None)
-        legacy_th = self.cfg.pop("inter_robot_obs_sigma_theta", None)
-        if legacy_xy is not None:
-            self.cfg.setdefault("inter_robot_obs_sigma_range",  legacy_xy)
-        if legacy_th is not None:
-            self.cfg.setdefault("inter_robot_obs_sigma_bearing", legacy_th)
+        # ✅ 修复3: Legacy字段处理保留优先级
+        legacy_xy = self.cfg.get("inter_robot_obs_sigma_xy")
+        legacy_th = self.cfg.get("inter_robot_obs_sigma_theta")
+        
+        # 移除legacy字段，避免传递给下游
+        if "inter_robot_obs_sigma_xy" in self.cfg:
+            del self.cfg["inter_robot_obs_sigma_xy"]
+        if "inter_robot_obs_sigma_theta" in self.cfg:
+            del self.cfg["inter_robot_obs_sigma_theta"]
+        
+        # 只在新字段不存在时才使用legacy值
+        if legacy_xy is not None and "inter_robot_obs_sigma_range" not in self.cfg:
+            self.cfg["inter_robot_obs_sigma_range"] = legacy_xy
+        if legacy_th is not None and "inter_robot_obs_sigma_bearing" not in self.cfg:
+            self.cfg["inter_robot_obs_sigma_bearing"] = legacy_th
 
     def build(self, robot_paths: Union[np.ndarray, List[np.ndarray]], 
               landmark_pos: np.ndarray, 
@@ -623,40 +635,42 @@ class GBPGraphBuilder:
         self._initial_cache_stats = get_global_cache_stats()
         logger.debug("Initial cache stats: %s", self._initial_cache_stats)
 
+    # ✅ 修复4: 观测噪声矩阵缓存问题
     def _get_observation_noise_matrix(self, range_val: float) -> np.ndarray:
-        """✅ 优化的观测噪声矩阵，集成factor_ut数值改进"""
-        # 生成缓存键
-        cache_key = None
-        if not self.cfg["enable_adaptive_noise"]:
-            config_hash = hash((
-                self.cfg["obs_sigma_bearing"], 
-                self.cfg["obs_sigma_range"],
-                numerical_config.regularization
-            ))
-            cache_key = f"obs_noise_{config_hash}"
-            
-            if cache_key in self._local_cache["noise_matrices"]:
-                return self._local_cache["noise_matrices"][cache_key].copy()
+        """✅ 修复的观测噪声矩阵，正确处理自适应噪声缓存"""
         
-        # 计算噪声矩阵
-        sigma_bearing = self.cfg["obs_sigma_bearing"]
-        sigma_range = self.cfg["obs_sigma_range"]
-        
+        # 如果启用自适应噪声，直接计算，不使用缓存
         if self.cfg["enable_adaptive_noise"]:
+            sigma_bearing = self.cfg["obs_sigma_bearing"]
+            sigma_range = self.cfg["obs_sigma_range"]
+            
             range_factor = 1.0 + 0.1 * (range_val / 10.0)
             sigma_range *= range_factor
             sigma_bearing *= math.sqrt(range_factor)
+            
+            R = np.diag([sigma_bearing**2, sigma_range**2])
+            return ensure_positive_definite(R, numerical_config.regularization)
         
+        # 非自适应噪声使用缓存
+        config_hash = hash((
+            self.cfg["obs_sigma_bearing"], 
+            self.cfg["obs_sigma_range"],
+            numerical_config.regularization
+        ))
+        cache_key = f"obs_noise_{config_hash}"
+        
+        if cache_key in self._local_cache["noise_matrices"]:
+            return self._local_cache["noise_matrices"][cache_key].copy()
+        
+        # 计算并缓存
+        sigma_bearing = self.cfg["obs_sigma_bearing"]
+        sigma_range = self.cfg["obs_sigma_range"]
         R = np.diag([sigma_bearing**2, sigma_range**2])
-        
-        # ✅ 使用factor_ut的数值稳定方法
         R = ensure_positive_definite(R, numerical_config.regularization)
         
-        # 缓存结果
-        if cache_key:
-            self._local_cache["noise_matrices"][cache_key] = R.copy()
-        
+        self._local_cache["noise_matrices"][cache_key] = R.copy()
         return R
+
     # -------------------------------------------------------------------------
     def _get_inter_robot_noise_matrix(self) -> np.ndarray:
         cache_key = "inter_robot_noise_2dof"
@@ -668,7 +682,6 @@ class GBPGraphBuilder:
             cov = ensure_positive_definite(cov, numerical_config.regularization)
             self._local_cache["noise_matrices"][cache_key] = cov
         return self._local_cache["noise_matrices"][cache_key].copy()
-
 
     def _get_prior_sigma(self) -> np.ndarray:
         """获取先验约束标准差"""
@@ -836,6 +849,7 @@ class GBPGraphBuilder:
         if self.cfg["cache_warmup"]:
             self._warmup_factor_caches()
 
+    # ✅ 修复7: 改进因子排序
     def _optimize_factor_ordering_advanced(self):
         """✅ 高级因子排序，提高缓存局部性"""
         def factor_sort_key(factor):
@@ -843,51 +857,94 @@ class GBPGraphBuilder:
                 PriorFactor: 0,
                 OdometryFactor: 1, 
                 BearingRangeUTFactor: 2,
-                PoseToPoseUTFactor: 3,  # ✅ 新增
+                PoseToPoseUTFactor: 3,
                 LoopClosureFactor: 4
             }
             
-            # 变量引用用于局部性
+            # 主要变量引用用于局部性
             if isinstance(factor, PriorFactor):
                 var_ref = factor.var
+                var_ref2 = ""
             elif isinstance(factor, OdometryFactor):
                 var_ref = factor.v1
+                var_ref2 = factor.v2  # ✅ 加入第二个变量
             elif isinstance(factor, BearingRangeUTFactor):
                 var_ref = factor.pose_key
-            elif isinstance(factor, PoseToPoseUTFactor):  # ✅ 新增
+                var_ref2 = factor.lm_key
+            elif isinstance(factor, PoseToPoseUTFactor):
                 var_ref = factor.pose1_key
+                var_ref2 = factor.pose2_key
             elif isinstance(factor, LoopClosureFactor):
                 var_ref = factor.pose1_key
+                var_ref2 = factor.pose2_key
             else:
                 var_ref = ""
+                var_ref2 = ""
             
-            return (type_priority.get(type(factor), 999), var_ref)
+            # ✅ 改进的排序键：类型 + 主变量 + 次变量
+            combined_ref = f"{var_ref}:{var_ref2}"
+            return (type_priority.get(type(factor), 999), combined_ref)
         
         self.factors.sort(key=factor_sort_key)
-        logger.debug("Optimized factor ordering for cache locality")
+        logger.debug("Optimized factor ordering for improved cache locality")
 
+    # ✅ 修复8: 改进缓存预热
     def _warmup_factor_caches(self):
-        """✅ 预热因子缓存"""
+        """✅ 改进的因子缓存预热，确保覆盖所有因子类型"""
         if len(self.factors) == 0 or len(self.variables) == 0:
             return
         
         try:
-            # 创建虚拟状态进行预热
-            dummy_mu = {var: val.copy() for var, val in list(self.variables.items())[:10]}
-            dummy_cov = {var: np.eye(len(val)) * 0.01 for var, val in dummy_mu.items()}
+            # 按因子类型分组采样
+            factor_samples = {
+                PriorFactor: [],
+                OdometryFactor: [],
+                BearingRangeUTFactor: [],
+                PoseToPoseUTFactor: [],
+                LoopClosureFactor: []
+            }
             
-            # 选择几个代表性因子进行预热
-            sample_factors = self.factors[:min(5, len(self.factors))]
-            for factor in sample_factors:
-                try:
-                    factor.linearize(dummy_mu, dummy_cov)
-                    factor.get_energy(dummy_mu)
-                except:
-                    pass
+            # 每种类型采样1-2个因子
+            for factor in self.factors:
+                factor_type = type(factor)
+                if factor_type in factor_samples and len(factor_samples[factor_type]) < 2:
+                    factor_samples[factor_type].append(factor)
             
-            logger.debug("Cache warmup completed")
+            # 创建覆盖所有变量类型的虚拟状态
+            pose_vars = {k: v for k, v in self.variables.items() if k.startswith('x')}
+            landmark_vars = {k: v for k, v in self.variables.items() if k.startswith('l')}
+            
+            # 选择代表性变量（每种类型至少1个）
+            dummy_mu = {}
+            dummy_cov = {}
+            
+            # 添加姿态变量样本
+            pose_items = list(pose_vars.items())[:5]  # 最多5个姿态
+            for var, val in pose_items:
+                dummy_mu[var] = val.copy()
+                dummy_cov[var] = np.eye(len(val)) * 0.01
+            
+            # 添加地标变量样本  
+            landmark_items = list(landmark_vars.items())[:3]  # 最多3个地标
+            for var, val in landmark_items:
+                dummy_mu[var] = val.copy()
+                dummy_cov[var] = np.eye(len(val)) * 0.01
+            
+            # 对每种因子类型进行预热
+            total_warmed = 0
+            for factor_type, samples in factor_samples.items():
+                for factor in samples:
+                    try:
+                        factor.linearize(dummy_mu, dummy_cov)
+                        factor.get_energy(dummy_mu)
+                        total_warmed += 1
+                    except:
+                        pass  # 忽略预热失败
+            
+            logger.debug(f"Cache warmup completed: {total_warmed} factors warmed")
+            
         except Exception as e:
-            logger.debug("Cache warmup failed: %s", str(e))
+            logger.debug(f"Cache warmup failed: {str(e)}")
 
     def _finalize_build(self):
         """完成构建，更新统计信息"""
@@ -943,19 +1000,28 @@ class GBPGraphBuilder:
         
         logger.debug("Added %d landmark variables", len(self._landmarks))
 
+    # ✅ 修复5: 无条件角度归一化
     def _normalize_robot_paths(self, robot_paths) -> List[np.ndarray]:
         """标准化机器人路径格式"""
         if isinstance(robot_paths, np.ndarray):
             if robot_paths.ndim == 3:
-                return [robot_paths[i] for i in range(robot_paths.shape[0])]
+                normalized_paths = [robot_paths[i] for i in range(robot_paths.shape[0])]
             elif robot_paths.ndim == 2:
-                return [robot_paths]
+                normalized_paths = [robot_paths]
             else:
                 raise ValueError(f"Invalid robot_paths dimensions: {robot_paths.shape}")
         elif isinstance(robot_paths, list):
-            return [np.asarray(path, dtype=np.float64) for path in robot_paths]
+            normalized_paths = [np.asarray(path, dtype=np.float64) for path in robot_paths]
         else:
             raise ValueError(f"Invalid robot_paths type: {type(robot_paths)}")
+        
+        # ✅ 无条件角度归一化，确保数值稳定性
+        for i, path in enumerate(normalized_paths):
+            if path.shape[1] >= 3:  # 确保有角度列
+                path[:, 2] = np.array([wrap_angle(angle) for angle in path[:, 2]])
+                logger.debug(f"Normalized angles for robot {i}")
+        
+        return normalized_paths
 
     def _validate_measurement_params(self, robot_id, time_step, landmark_id) -> bool:
         """验证测量参数"""
@@ -1058,6 +1124,18 @@ class GBPGraphBuilder:
         self.factors.append(factor)
         return True
 
+    # ✅ 修复6: 安全的None检查辅助函数
+    def _safe_none_check(self, *values) -> bool:
+        """安全的None检查，避免numpy数组的truth value问题"""
+        for val in values:
+            try:
+                if val is None:
+                    return True
+            except ValueError:
+                # numpy数组可能抛出"truth value is ambiguous"
+                continue
+        return False
+
     def _add_loop_closure_factors(self, loop_closures: List[Dict[str, Any]]):
         """添加环路闭合因子"""
         logger.info("Adding %d loop closure factors...", len(loop_closures))
@@ -1072,8 +1150,8 @@ class GBPGraphBuilder:
                 relative_pose = closure.get("relative_pose")
                 information = closure.get("information_matrix")
                 
-                # if None in [robot1_id, time1, robot2_id, time2, relative_pose]:
-                if any(x is None for x in (robot1_id, time1, robot2_id, time2, relative_pose)):
+                # ✅ 修复6: 使用安全的None检查
+                if self._safe_none_check(robot1_id, time1, robot2_id, time2, relative_pose):
                     continue
                 
                 pose1_key = f"x{robot1_id}_{time1}"
@@ -1399,4 +1477,3 @@ __all__ = [
     'create_single_robot_graph', 'create_multi_robot_graph', 'create_high_performance_graph',
     'PerformanceMonitor'
 ]
-
