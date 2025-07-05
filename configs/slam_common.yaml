@@ -3,10 +3,10 @@ noise:
   # ------- Builder / Measurement 共用 -------
   prior_sigma_xy:      0.05
   prior_sigma_theta:   0.02
-  odom_sigma_xy:       0.08
-  odom_sigma_theta:    0.015
-  obs_sigma_bearing:   0.0523599     # ≈3°
-  obs_sigma_range:     0.12
+  odom_sigma_xy:       0.15
+  odom_sigma_theta:    0.03
+  obs_sigma_bearing:   0.087266    # ≈5°
+  obs_sigma_range:     0.2
   # ------- MeasurementGenerator 专用别名 -------
   bearing_noise_std:   0.0523599     
   range_noise_std:     0.12

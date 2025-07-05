@@ -1,0 +1,27 @@
+# fyp_slam/pyproject.toml
+[build-system]                 # 构建后端及其自身依赖
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]                      # PEP 621 元数据
+name = "fyp_slam"
+version = "0.0.1"
+description = "Multi-Robot GBP/SPBP-SLAM research code"
+readme = "README.md"
+requires-python = ">=3.8"
+
+# 运行依赖
+dependencies = [
+  "numpy>=1.22",
+  "scipy>=1.9",
+  "matplotlib>=3.6",
+]
+
+# 可选依赖
+[project.optional-dependencies]
+dev = ["pytest", "black", "flake8"]
+
+# 让 setuptools 自动发现所有含 __init__.py 的包
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tests", "docs*", "examples*"]

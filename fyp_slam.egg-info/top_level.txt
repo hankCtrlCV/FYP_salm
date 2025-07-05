@@ -1,2 +1,5 @@
 algorithm
+configs
+gtsam_local
 sim
+utils
