@@ -1,18 +1,43 @@
-# configs/slam_gbp.yaml
-ut:                # 只对 GBP 有意义
-  ut_mode:          "gbp"
-  ut_alpha:         0.05
-  ut_beta:          2.0
-  ut_kappa:         0.0
-  ut_linear_threshold:    4.0
-  ut_residual_threshold:  2.5
-  
+# ------------------------------------------------------------------
+# ①  Unscented-Transform / GBP 相关参数
+ut:
+  ut_mode: gbp            # 先固定纯 GBP，排除 SPBP 额外数值噪声
+  "inter_robot_obs_mode": "gbp"
+  ut_alpha: 0.05
+  ut_beta:  2.0
+  ut_kappa: 0.0
+  ut_linear_threshold:   4.0
+  ut_residual_threshold: 2.5
+
+# ------------------------------------------------------------------
+# ②  **数值阈值** – 重点！
 numerical_config:
-    regularization:        1.0e-9
-    max_condition_number:  1.0e7
+  regularization:        1.0e-1      # or even 0.1
+  min_eigenvalue:        1.0e-3    # or 1.0e-3
+  max_condition_number:  1.0e7     # 保守收紧阈值
+  jacobian_clip_threshold: 1e4
+  small_angle_threshold:   1.0e-3
 
-
+# ------------------------------------------------------------------
+# ③  性能与缓存（保持不变即可）
 performance:
-  enable_vectorization:   true
-  enable_batch_processing: true
-  enable_factor_reordering: true
+  enable_vectorization:      true
+  enable_batch_processing:   false
+  enable_factor_reordering:  true
+  default_cache_size:        128
+  sigma_param_cache_size:    64
+  energy_cache_size:         512
+  spbp_cache_size:           256
+  jacobian_cache_size:       128
+
+# ------------------------------------------------------------------
+# ④  Builder 级别开关
+builder:
+  enable_strict_validation:  true
+  enable_visibility_check:   false
+  enable_inter_robot_observations: false
+  clear_caches_on_init:      true
+  cache_warmup:              true
+  enable_cache_coordination: true
+  enable_performance_monitoring: false
+  enable_adaptive_noise:     false

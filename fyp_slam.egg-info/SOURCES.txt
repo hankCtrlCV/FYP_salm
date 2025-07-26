@@ -1,9 +1,11 @@
 README.md
 pyproject.toml
+setup.py
 algorithm/__init__.py
 algorithm/backend/admm.py
 algorithm/backend/consensus.py
 algorithm/frontend/__init__.py
+algorithm/frontend/factor_gbp.py
 algorithm/frontend/factor_ut.py
 algorithm/frontend/gbp.py
 algorithm/frontend/graph_build.py
@@ -17,9 +19,11 @@ fyp_slam.egg-info/top_level.txt
 gtsam_local/build_gtsam_graph.py
 gtsam_local/gtsam_runner.py
 sim/__init__.py
+sim/debug.py
 sim/demo.py
-sim/factor_ut_test.py
 sim/factorgraph_test.py
 sim/measurement.py
+sim/test_factor.py
+sim/test_pose_only_gbp.py
 sim/world.py
 utils/cfg_loader.py

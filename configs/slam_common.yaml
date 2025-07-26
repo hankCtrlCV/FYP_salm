@@ -1,18 +1,18 @@
 # configs/slam_common.yaml   
 noise:
   # ------- Builder / Measurement 共用 -------
-  prior_sigma_xy:      0.05
-  prior_sigma_theta:   0.02
+  prior_sigma_xy:      1.0
+  prior_sigma_theta:   1.0
   odom_sigma_xy:       0.15
-  odom_sigma_theta:    0.03
-  obs_sigma_bearing:   0.087266    # ≈5°
-  obs_sigma_range:     0.2
+  odom_sigma_theta:    0.1
+  obs_sigma_bearing:   0.1
+  obs_sigma_range:     0.05
   # ------- MeasurementGenerator 专用别名 -------
   bearing_noise_std:   0.0523599     
   range_noise_std:     0.12
   # ------- Inter-robot / Loop closure -------
   inter_robot_obs_sigma_bearing: 0.0436332   # ≈2.5°
-  inter_robot_obs_sigma_range:   0.15
+  inter_robot_obs_sigma_range:   0.05
   loop_closure_sigma_xy:      0.16
   loop_closure_sigma_theta:   0.03
 
@@ -31,7 +31,7 @@ obs:
 
 anchor:
   add_anchor:      true
-  anchor_strategy: "landmarks"   # landmarks / poses / mixed
+  anchor_strategy: "mixed"   # landmarks / poses / mixed
 
 measurement:
   landmark_detection_prob: 1.0

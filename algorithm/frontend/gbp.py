@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
+from algorithm.frontend.factor_ut import ensure_positive_definite
 
 import numpy as np
 import scipy.linalg
@@ -14,11 +15,11 @@ import scipy.linalg
 _log = logging.getLogger("GaBP")
 
 # ─── Numerical constants ───────────────────────────────────
-_EPS       = 1.0e-8
-_DAMP_BEL  = 0.50          # belief-update damping
-_DAMP_MSG  = 0.30          # message-update damping
-_CLIP_SV   = 1.0e6         # singular-value clipping upper-bound
-_MIN_PREC  = 1.0e-12       # minimum precision for numerical stability
+_EPS       = 1.0e-10
+_DAMP_BEL  = 0.80          # belief-update damping
+_DAMP_MSG  = 0.80          # message-update damping
+_CLIP_SV   = 1.0e5         # singular-value clipping upper-bound
+_MIN_PREC  = 1.0e-5       # minimum precision for numerical stability
 
 # ─── Helper functions ──────────────────────────────────────
 def wrap_angle(t: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
@@ -30,15 +31,29 @@ def angle_diff(a1: float, a2: float) -> float:
     """Compute angular difference a1 - a2 wrapped to [-π, π]."""
     return wrap_angle(a1 - a2)
 
-def make_pd(A: np.ndarray, eps: float = _EPS) -> np.ndarray:
-    """Ensure positive-definite by eigenvalue flooring with better conditioning."""
+def is_pd(L: np.ndarray, tol: float = 1e-10) -> bool:
+    """Check if matrix is positive definite within a numerical tolerance."""
+    min_eig = np.linalg.eigvalsh(L).min()
+    return min_eig > -tol
+
+def make_pd(A: np.ndarray, eps: float = 1e-8, clip_sv: float = 1e5) -> np.ndarray:
+    """Ensure positive-definite by eigenvalue flooring and upper bound."""
     A = 0.5 * (A + A.T)
-    w, Q = np.linalg.eigh(A)
-    # More aggressive regularization for numerical stability
-    w = np.maximum(w, eps)
-    # Add small diagonal regularization
-    w += eps * np.max(w)
-    return Q @ np.diag(w) @ Q.T
+    try:
+        w, Q = np.linalg.eigh(A)
+        # 先上界clip，再下界floor
+        w_clipped = np.clip(w, -clip_sv, clip_sv)
+        w_safe = np.maximum(w_clipped, eps)
+        # 检查有无修正
+        if np.any(w < eps):
+            # print(f"[make_pd] Info: eigenvalue corrected: {w} => {w_safe}")
+            pass
+        return Q @ np.diag(w_safe) @ Q.T
+    except Exception:
+        # 数值异常兜底
+        dim = A.shape[0]
+        return np.eye(dim) * eps
+
 
 def stable_inv(M: np.ndarray, reg: float = _MIN_PREC) -> np.ndarray:
     """Numerically stable matrix inversion with regularization."""
@@ -51,11 +66,10 @@ def stable_inv(M: np.ndarray, reg: float = _MIN_PREC) -> np.ndarray:
         L = np.linalg.cholesky(M_reg)
         return np.linalg.solve(L, np.linalg.solve(L.T, np.eye(M.shape[0])))
     except np.linalg.LinAlgError:
-        # Fallback to SVD
         U, s, Vt = np.linalg.svd(M_reg, full_matrices=False)
-        s_inv = 1.0 / np.maximum(s, _EPS)
-        return Vt.T @ np.diag(s_inv) @ U.T
-
+        s = np.clip(s, _MIN_PREC, _CLIP_SV)
+        return Vt.T @ np.diag(1.0 / s) @ U.T
+    
 def info_to_gaussian(L: np.ndarray, eta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Convert information form to moment form."""
     Σ = stable_inv(L)
@@ -65,63 +79,57 @@ def info_to_gaussian(L: np.ndarray, eta: np.ndarray) -> Tuple[np.ndarray, np.nda
 
 def _clip_pair(L: np.ndarray, eta: np.ndarray,
                s_max_lim: float = _CLIP_SV) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    If the greatest singular value of L exceeds s_max_lim, uniformly scale
-    (L, η) so that the new max-SV equals s_max_lim while keeping μ unchanged.
-    Since μ = L⁻¹η, scaling both by the same factor keeps μ invariant.
-    """
     if L.size == 0:
         return L, eta
 
     try:
-        s_max = np.linalg.svd(L, compute_uv=False).max()
-        if s_max > s_max_lim:
-            scale = s_max_lim / s_max          # 直接压缩到阈值
-            return L * scale, eta * scale      # 同一次幂保持 μ 不变
-    except Exception:      # SVD 失败直接跳过
+        s_max = np.abs(np.linalg.eigvalsh(L)).max()
+        if s_max <= s_max_lim:
+            return L, eta
+
+        w, Q = np.linalg.eigh(L)
+
+        if np.abs(w).max() > s_max_lim:
+            w_clipped = np.clip(w, -s_max_lim, s_max_lim)
+            # 先 clip，再直接做 eigen-floor 保 PD
+            w_safe = np.maximum(w_clipped, _EPS)
+            L_clipped = Q @ np.diag(w_safe) @ Q.T            # 已 PD
+
+            # μ = L⁻¹η, 用同一 (Q, w_safe)
+            mu = Q @ ((Q.T @ eta) / w_safe)
+            eta_new = L_clipped @ mu
+            return L_clipped, eta_new
+    except Exception:
         pass
     return L, eta
 
 
-def safe_subtract_info(L1: np.ndarray, eta1: np.ndarray, 
-                      L2: np.ndarray, eta2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Safely subtract information matrices while maintaining PD property.
-    
-    When L_diff = L1 - L2 becomes indefinite, we project it to PD space.
-    To maintain consistency, we have two options:
-    1. Keep η_diff = η1 - η2 (simpler, may be inconsistent)
-    2. Re-project η to maintain μ consistency (more complex, numerically stable)
-    """
+def safe_subtract_info(L1, eta1, L2, eta2):
     L_diff = L1 - L2
     eta_diff = eta1 - eta2
-    
-    # Check if result is already positive definite
+
     try:
-        w_min = np.linalg.eigvals(L_diff).min()
-        if w_min >= _MIN_PREC:
-            return L_diff, eta_diff  # Already PD, no projection needed
+        if is_pd(L_diff, tol=1e-10):
+            return L_diff, eta_diff  # Already PD
     except:
         pass
-    
-    # Project to PD space
+
+    # Project to PD
     w, Q = np.linalg.eigh(L_diff)
     w_clipped = np.maximum(w, _MIN_PREC)
     L_pd = Q @ np.diag(w_clipped) @ Q.T
-    
-    # Option 1: Simple approach (keeps original eta_diff)
-    # This is faster but may introduce slight inconsistency
-    if True:  # Use simple approach by default
-        return L_pd, eta_diff
-    
-    # Option 2: Consistency-preserving approach
-    # Re-project η onto new precision to maintain self-consistency
+
+    # Option 2: 重新同步η，保证 mean 不变
+    # 先计算 mean: mu = L_diff^-1 @ eta_diff
     try:
         mu_tmp = stable_inv(L_pd) @ eta_diff
         eta_consistent = L_pd @ mu_tmp
         return L_pd, eta_consistent
-    except:
-        # Fallback to simple approach if projection fails
+    except Exception as e:
+        # 兜底：数值出错时退回 Option 1
+        print(f"[WARN] Option 2 η修正失败, fallback to Option 1: {e}")
         return L_pd, eta_diff
+
 
 # ─── Variable node ─────────────────────────────────────────
 class VarNode:
@@ -192,14 +200,17 @@ class VarNode:
         # Compute new mean
         mu_new, _ = info_to_gaussian(L_damped, eta_damped)
         
-        # Handle angle updates properly
+        # Handle angle updates properly - 修正版本
         if self.angle_indices:
             for idx in self.angle_indices:
                 if 0 <= idx < self.dim:
-                    # Use angular difference for proper angle updates
-                    angle_diff_val = angle_diff(mu_new[idx], self.mu[idx])
-                    mu_new[idx] = wrap_angle(self.mu[idx] + angle_diff_val)
-
+                    # 计算最短角度路径更新
+                    raw_diff = mu_new[idx] - self.mu[idx]
+                    wrapped_diff = wrap_angle(raw_diff)
+                    mu_new[idx] = wrap_angle(self.mu[idx] + wrapped_diff)
+            
+            # 🔥 关键修复：角度wrap后重新同步η
+            eta_damped = L_damped @ mu_new
         
         # Compute convergence metric
         delta = float(np.linalg.norm(mu_new - self.mu))
@@ -208,29 +219,45 @@ class VarNode:
         self.mu_prev = self.mu.copy()
         self.mu = mu_new
         self.L = L_damped
-        self.eta = eta_damped
+        self.eta = eta_damped  # 现在η与wrapped μ保持一致
         self.history.append(self.mu.copy())
         
         return delta
 
 # ─── Factor node ─────────────────────────────────────────────
 class FacNode:
-    def __init__(self, fid: int, factor: Any, vkeys: List[str]):
+    def __init__(self, fid: int, factor: Any, mu: Dict[str, np.ndarray], cov: Dict[str, np.ndarray]):
         self.id   = fid
         self.fact = factor
-        self.vars = [k for k in vkeys if factor._get_dim(k) > 0]
+
+        # 关键：直接用当前mu/cov调用linearize获取所有涉及变量的key
+        blocks = factor.linearize(mu, cov)
+        # 只保留str类型key，即所有单变量相关（支持tuple可扩展）
+        self.vars = [k for k in blocks if isinstance(k, str)]
         self.prev_msg = {k: (np.zeros((factor._get_dim(k), factor._get_dim(k))),
                              np.zeros(factor._get_dim(k))) for k in self.vars}
-        self.robot_set = {  # 记录与此因子相连的所有机器人 ID
-            int(v.split('_')[0][1:])            # 从 'x0_3' 提取 0
-            for v in self.vars if v.startswith('x')
+        self.robot_set = {
+            int(v.split('_')[0][1:]) for v in self.vars if v.startswith('x')
         }
+        # print(f"Adapter type: {type(self.fact)}, raw type: {type(self.fact._f)}")
+
 
     def reset(self):
-        """Reset all previous messages."""
         for k in self.vars:
             dim = self.fact._get_dim(k)
             self.prev_msg[k] = (np.zeros((dim, dim)), np.zeros(dim))
+
+
+def _extract_block_tuple(block, dim):
+    if isinstance(block, tuple) and len(block) == 2:
+        return block
+    elif isinstance(block, np.ndarray):
+        print(f"[WARN] Factor block 只返回矩阵，无eta: {block.shape}")
+        return block, np.zeros(dim)
+    else:
+        print(f"[WARN] Factor block 类型异常: {type(block)}, 内容: {block}")
+        return np.zeros((dim, dim)), np.zeros(dim)
+
 
 # ─── GBP graph ─────────────────────────────────────────────
 class GBPGraph:
@@ -238,24 +265,23 @@ class GBPGraph:
                  priors: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
                  angle_vars: Optional[Dict[str, List[int]]] = None,
                  bel_damp: float = _DAMP_BEL, msg_damp: float = _DAMP_MSG):
-        
+
         self.d_bel, self.d_msg = float(bel_damp), float(msg_damp)
-        
-        # Variable nodes
         self.v: Dict[str, VarNode] = {}
         for k, μ0 in variables.items():
             pm, ps = priors.get(k, (None, None)) if priors else (None, None)
             angle_idx = angle_vars.get(k) if angle_vars else None
             self.v[k] = VarNode(k, μ0.size, μ0, self.d_bel, pm, ps, angle_idx)
-        
-        # Factor nodes
+
+        # -- Patch here: FacNode正确收集变量 --
         self.f: List[FacNode] = []
+        mu_init = {k: v.mean() for k, v in self.v.items()}
+        cov_init = {k: np.eye(v.dim)*0.01 for k, v in self.v.items()}
         for fid, fac in enumerate(factors):
-            keys = [k for k in self.v if fac._get_dim(k) > 0]
-            if keys:
-                fn = FacNode(fid, fac, keys)
+            fn = FacNode(fid, fac, mu_init, cov_init)
+            if fn.vars:
                 self.f.append(fn)
-                for k in keys:
+                for k in fn.vars:
                     self.v[k].fids.append(fid)
         
         # Message storage
@@ -277,15 +303,22 @@ class GBPGraph:
         return robot_vars
 
     def _get_robot_id(self, var_name: str) -> Optional[int]:
-        """从变量名提取机器人ID"""
-        if var_name.startswith('x'):
-            parts = var_name.split('_')
-            if len(parts) >= 2:
-                # 格式如 'x0_1' 表示机器人0的第1个位姿
+        """从变量名提取机器人ID - 更鲁棒的版本"""
+        # 支持多种命名约定
+        patterns = [
+            r'^x(\d+)_',    # x0_1, x1_2 等
+            r'^robot(\d+)_', # robot0_pose 等
+            r'^r(\d+)_',    # r0_1 等
+        ]
+        
+        import re
+        for pattern in patterns:
+            match = re.match(pattern, var_name)
+            if match:
                 try:
-                    return int(parts[0][1:])  # 提取'x'后的数字
+                    return int(match.group(1))
                 except ValueError:
-                    pass
+                    continue
         return None
 
     
@@ -357,24 +390,25 @@ class GBPGraph:
             for tgt in fn.vars:
                 vn = self.v[tgt]
                 dim = vn.dim
-                
-                # Get blocks related to target variable
-                Lkk, ηk = blocks.get(tgt, (np.zeros((dim, dim)), np.zeros(dim)))
+
+                # ---- PATCH: 安全解包对角块 ----
+                Lkk, ηk = _extract_block_tuple(blocks.get(tgt, None), dim)
                 Lkk = make_pd(Lkk, _MIN_PREC)
+
                 
                 # Schur complement for other variables
                 for oth in fn.vars:
                     if oth == tgt:
                         continue
                     
-                    # Get cross terms
+                    Lkj = None
                     if (tgt, oth) in blocks:
                         Lkj = blocks[(tgt, oth)]
                     elif (oth, tgt) in blocks:
                         Lkj = blocks[(oth, tgt)].T
-                    else:
+                    if Lkj is None or not isinstance(Lkj, np.ndarray):
                         continue
-                    
+                                
                     # Get other variable's message and block
                     Lj_msg, ηj_msg = self.m_v2f.get((oth, fn.id),
                                                    (np.zeros((self.v[oth].dim,
@@ -392,14 +426,16 @@ class GBPGraph:
                     try:
                         Ljj_inv = stable_inv(Ljj_total)
                         # Update target blocks
-                        Lkk -= Lkj @ Ljj_inv @ Lkj.T
-                        ηk -= Lkj @ Ljj_inv @ ηj_total
+                        # 计算Schur complement项
+                        schur_term = Lkj @ Ljj_inv @ Lkj.T
+                        schur_eta = Lkj @ Ljj_inv @ ηj_total
+                        
+                       # —— 统一用 safe_subtract_info 做 “信息减法 + 投影” ——
+                        Lkk, ηk = safe_subtract_info(Lkk, ηk, schur_term, schur_eta)
+
                     except Exception as e:
                         _log.warning(f"Schur complement failed for factor {fn.id}: {e}")
-                        continue
-                
-                # Ensure positive definite
-                Lkk = make_pd(Lkk, _MIN_PREC)
+                        pass
                 
                 # Damping
                 L_prev, η_prev = self.m_f2v.get((fn.id, tgt),
@@ -452,16 +488,31 @@ class GBPGraph:
         for fn in self.f:
             fn.reset()
         self.max_delta_history.clear()
-        self.comm_bytes = 0
+        
+        comm_bytes_this_run = 0
         
         if verbose:
             _log.info(f"Starting GBP with {len(self.v)} variables, {len(self.f)} factors")
         
+        prev_delta = float('inf')
         for iteration in range(max_iter):
+            old_comm = self.comm_bytes
             delta = self._sweep()
+            comm_bytes_this_run += (self.comm_bytes - old_comm)
             
             if verbose and (iteration % 10 == 0 or delta < tol):
                 _log.info(f"Iter {iteration:3d} | max Δ = {delta:.2e}")
+                
+            # ── ③-A 自适应阻尼 ──────────────────────────────────
+            # 目标：如果震荡 / 发散⇒减小 damping；快速收敛⇒适度增大
+            if delta > prev_delta * 1.2:       # 明显反弹
+                self.d_msg *= 0.5
+                self.d_bel *= 0.5
+            elif delta < prev_delta * 0.5:     # 收敛速度很快
+                self.d_msg = min(self.d_msg * 1.1, 0.8)
+                self.d_bel = min(self.d_bel * 1.1, 0.8)
+            prev_delta = delta
+            # ────────────────────────────────────────────────
             
             # Check for numerical issues
             if not np.isfinite(delta) or delta > 1e8:
@@ -480,7 +531,8 @@ class GBPGraph:
         stats = {
             "iterations": len(self.max_delta_history),
             "converged": len(self.max_delta_history) > 0 and self.max_delta_history[-1] < tol,
-            "comm_bytes": self.comm_bytes,
+            "comm_bytes": comm_bytes_this_run,  # 只报告本次运行的通信量
+            "total_comm_bytes": self.comm_bytes,  # 总累积通信量
             "final_delta": self.max_delta_history[-1] if self.max_delta_history else float('inf')
         }
         return self.max_delta_history, stats
@@ -530,6 +582,8 @@ class GBPGraph:
         self.m_f2v.clear()
         for fn in self.f:
             fn.reset()
+        # 🔥 修复：同步重置通信统计
+        self.comm_bytes = 0
     
     def get_variable_history(self, var_key: str) -> List[np.ndarray]:
         """Get optimization history for a specific variable."""

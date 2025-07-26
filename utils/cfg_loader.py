@@ -58,6 +58,10 @@ def load_gbp() -> dict:
     # 1. ut.* 直接平铺
     if "ut" in ub and isinstance(ub["ut"], dict):
         _flatten(ub["ut"], cfg)
+    
+    if "builder" in ub and isinstance(ub["builder"], dict):
+        _flatten(ub["builder"], cfg)
+
 
     # 2. numerical_config 放进去（避免被 _flatten 毁掉类型）
     if "numerical_config" in ub.get("ut", {}):
